@@ -9,5 +9,4 @@ dist/
 build/
 .python-version
 settings.json5
-settings.json
 *.log

@@ -60,6 +60,7 @@ def get_input_devices():
 class SpeechToType:
     def __init__(self, settings_path=DEFAULT_SETTINGS_PATH):
         self.model = None
+        self.loaded_model_idx = None
         self.icon = None
         self._key_held = False
         self._recording = False
@@ -246,6 +247,7 @@ class SpeechToType:
             sys.stderr = real_stderr
 
         elapsed = time.perf_counter() - t0
+        self.loaded_model_idx = self.model_idx
         self.status = f"Ready (model loaded in {elapsed:.1f}s)"
         self._needs_redraw = True
 
@@ -542,7 +544,8 @@ class SpeechToType:
         attr = curses.A_REVERSE if selected == 2 else 0
         model_name = MODELS[self.model_idx]
         safe_addstr(4, 0, f"{prefix}Model:         ", curses.A_BOLD if selected == 2 else 0)
-        safe_addstr(4, 17, f" < {model_name} > (Enter to reload) ", attr)
+        model_hint = "(current)" if self.model_idx == self.loaded_model_idx else "(Enter to reload)"
+        safe_addstr(4, 17, f" < {model_name} > {model_hint} ", attr)
 
         # Hotkey
         prefix = "> " if selected == 3 else "  "
@@ -626,7 +629,8 @@ class SpeechToType:
             status_color = curses.color_pair(1)
         else:
             status_color = curses.color_pair(4)
-        safe_addstr(status_y, 10, self.status, status_color)
+        model_label = MODELS[self.loaded_model_idx] if self.loaded_model_idx is not None else "none"
+        safe_addstr(status_y, 10, f"{self.status}  [model: {model_label}]", status_color)
 
         # Last transcription — fills space between description and status
         if self.last_text:
