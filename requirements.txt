@@ -1,0 +1,9 @@
+openai-whisper
+sounddevice
+numpy
+keyboard
+pystray
+Pillow
+windows-curses
+json5
+pycaw
