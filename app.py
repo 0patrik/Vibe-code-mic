@@ -15,6 +15,7 @@ import curses
 import numpy as np
 import sounddevice as sd
 import keyboard
+import torch
 import whisper
 import pystray
 from PIL import Image, ImageDraw
@@ -242,13 +243,21 @@ class SpeechToType:
 
         sys.stderr = ProgressCapture()
         try:
-            self.model = whisper.load_model(model_name)
+            # Free previous model from VRAM before loading new one
+            if self.model is not None:
+                del self.model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                self.model = None
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.model = whisper.load_model(model_name, device=device)
         finally:
             sys.stderr = real_stderr
 
         elapsed = time.perf_counter() - t0
         self.loaded_model_idx = self.model_idx
-        self.status = f"Ready (model loaded in {elapsed:.1f}s)"
+        dev = self.model.device
+        self.status = f"Ready on {dev} (model loaded in {elapsed:.1f}s)"
         self._needs_redraw = True
 
     def _audio_callback(self, indata, frames, time_info, status):
@@ -384,7 +393,8 @@ class SpeechToType:
         t0 = time.perf_counter()
         audio_padded = whisper.pad_or_trim(audio)
         mel = whisper.log_mel_spectrogram(audio_padded, n_mels=self.model.dims.n_mels).to(self.model.device)
-        options = whisper.DecodingOptions(language="en", fp16=False)
+        use_fp16 = self.model.device.type == "cuda"
+        options = whisper.DecodingOptions(language="en", fp16=use_fp16)
         result = whisper.decode(self.model, mel, options)
         text = result.text.strip()
         elapsed = time.perf_counter() - t0
@@ -513,17 +523,38 @@ class SpeechToType:
             if y < h and x < w:
                 stdscr.addnstr(y, x, text, w - x - 1, attr)
 
+        def wrap_text(text, avail):
+            """Word-wrap text to fit in avail columns. Returns list of lines."""
+            if avail <= 0:
+                return []
+            result = []
+            for paragraph in text.split('\n'):
+                words = paragraph.split(' ')
+                cur = ''
+                for word in words:
+                    if not cur:
+                        cur = word
+                    elif len(cur) + 1 + len(word) <= avail:
+                        cur += ' ' + word
+                    else:
+                        result.append(cur)
+                        cur = word
+                    # Force-break words longer than avail
+                    while len(cur) > avail:
+                        result.append(cur[:avail])
+                        cur = cur[avail:]
+                if cur or not paragraph:
+                    result.append(cur)
+            return result if result else ['']
+
         def draw_wrapped(y, x, text, attr=0):
             """Draw text wrapping across multiple lines. Returns number of lines used."""
             avail = w - x - 1
-            if avail <= 0:
-                return 0
-            lines = 0
-            while text and (y + lines) < h:
-                safe_addstr(y + lines, x, text[:avail], attr)
-                text = text[avail:]
-                lines += 1
-            return max(lines, 1)
+            lines = wrap_text(text, avail)
+            for i, line in enumerate(lines):
+                if (y + i) < h:
+                    safe_addstr(y + i, x, line, attr)
+            return max(len(lines), 1)
 
         safe_addstr(0, 0, "=== vibe-code-mic (Windows) ===", curses.A_BOLD)
 
@@ -616,9 +647,7 @@ class SpeechToType:
         help_y = h - 1
         safe_addstr(help_y, 0, "  Up/Down: navigate | Left/Right: change | Ctrl+C: quit")
 
-        # Status with color
-        status_y = help_y - 2
-        safe_addstr(status_y, 0, "  Status: ")
+        # Status with color (word-wrapped, grows upward from help line)
         if "Recording" in self.status:
             status_color = curses.color_pair(2) | curses.A_BOLD
         elif "Transcribing" in self.status:
@@ -630,7 +659,15 @@ class SpeechToType:
         else:
             status_color = curses.color_pair(4)
         model_label = MODELS[self.loaded_model_idx] if self.loaded_model_idx is not None else "none"
-        safe_addstr(status_y, 10, f"{self.status}  [model: {model_label}]", status_color)
+        status_text = f"{self.status}  [model: {model_label}]"
+        status_avail = w - 10 - 1
+        status_lines = wrap_text(status_text, status_avail)
+        status_line_count = max(len(status_lines), 1)
+        status_y = help_y - 1 - status_line_count
+        safe_addstr(status_y, 0, "  Status: ")
+        for i, sline in enumerate(status_lines):
+            if (status_y + i) < h:
+                safe_addstr(status_y + i, 10, sline, status_color)
 
         # Last transcription — fills space between description and status
         if self.last_text:
@@ -640,16 +677,11 @@ class SpeechToType:
             avail_width = w - 12
             if avail_lines > 0 and avail_width > 0:
                 safe_addstr(last_start_y, 0, "  Last:   ", curses.color_pair(4))
-                # Wrap the transcription text across available lines
+                # Word-wrap the transcription text across available lines
                 text_with_time = f'"{self.last_text}" ({self.last_time:.1f}s)'
-                line = 0
-                pos = 0
-                while pos < len(text_with_time) and line < avail_lines:
-                    chunk = text_with_time[pos:pos + avail_width]
-                    x = 10 if line == 0 else 10
-                    safe_addstr(last_start_y + line, x, chunk, curses.A_BOLD)
-                    pos += avail_width
-                    line += 1
+                wrapped = wrap_text(text_with_time, avail_width)
+                for line, chunk in enumerate(wrapped[:avail_lines]):
+                    safe_addstr(last_start_y + line, 10, chunk, curses.A_BOLD)
 
         stdscr.refresh()
 

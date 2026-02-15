@@ -31,6 +31,11 @@ python app.py
 - Deafen system audio while recording
 - Interactive TUI for settings
 - Settings persist as JSON5
+- CUDA acceleration
+
+### GPU acceleration (CUDA)
+
+The default install includes CUDA-enabled PyTorch. If you have an NVIDIA GPU, the app auto-detects it and uses GPU acceleration — the status line will show `Ready on cuda:0`. No extra setup needed. Without a GPU, it falls back to CPU automatically.
 
 ### Limitations
 - No real-time typing; text appears after recording stops
