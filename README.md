@@ -2,7 +2,24 @@
 
 Local speech-to-text that types into whichever window you had active when starting. Uses OpenAI Whisper. Windows only. Designed claude code use case in mind.
 
+### Install
+
+```bash
+# Create and activate virtual environment
+python -m venv venv
+venv\Scripts\activate
+
+# Install all dependencies
+pip install -r requirements.txt
 ```
+
+### Run
+
+```bash
+# Activate virtual environment (if not already active)
+venv\Scripts\activate
+
+# Start the app
 python app.py
 ```
 
