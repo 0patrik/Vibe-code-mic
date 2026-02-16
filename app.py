@@ -79,9 +79,10 @@ class SpeechToType:
         self.model_idx = MODELS.index("small")
         self.cancel_key = "f3"
         self.no_enter_key = "f4"
-        self.deafen_while_recording = False
+        self.deafen_while_recording = "off"  # "off", "half", "on"
         self.settings_path = settings_path
         self._was_muted = False
+        self._prev_volume = None
         self._skip_enter = False
         self._cancel_type_used = False
 
@@ -134,7 +135,13 @@ class SpeechToType:
             if "no_enter_key" in data:
                 self.no_enter_key = data["no_enter_key"] or None
             if "deafen_while_recording" in data:
-                self.deafen_while_recording = bool(data["deafen_while_recording"])
+                val = data["deafen_while_recording"]
+                if val in ("off", "half", "on"):
+                    self.deafen_while_recording = val
+                elif val is True:
+                    self.deafen_while_recording = "on"
+                else:
+                    self.deafen_while_recording = "off"
         except Exception:
             pass
 
@@ -189,9 +196,13 @@ class SpeechToType:
             from pycaw.pycaw import AudioUtilities
             device = AudioUtilities.GetSpeakers()
             vol = device.EndpointVolume
-            self._was_muted = bool(vol.GetMute())
-            if not self._was_muted:
-                vol.SetMute(True, None)
+            if self.deafen_while_recording == "on":
+                self._was_muted = bool(vol.GetMute())
+                if not self._was_muted:
+                    vol.SetMute(True, None)
+            elif self.deafen_while_recording == "half":
+                self._prev_volume = vol.GetMasterVolumeLevelScalar()
+                vol.SetMasterVolumeLevelScalar(self._prev_volume * 0.5, None)
         except Exception as e:
             self.status = f"Deafen error: {e}"
             self._needs_redraw = True
@@ -203,8 +214,13 @@ class SpeechToType:
             from pycaw.pycaw import AudioUtilities
             device = AudioUtilities.GetSpeakers()
             vol = device.EndpointVolume
-            if not self._was_muted:
-                vol.SetMute(False, None)
+            if self.deafen_while_recording == "on":
+                if not self._was_muted:
+                    vol.SetMute(False, None)
+            elif self.deafen_while_recording == "half":
+                if self._prev_volume is not None:
+                    vol.SetMasterVolumeLevelScalar(self._prev_volume, None)
+                    self._prev_volume = None
         except Exception as e:
             self.status = f"Undeafen error: {e}"
             self._needs_redraw = True
@@ -257,8 +273,13 @@ class SpeechToType:
         elapsed = time.perf_counter() - t0
         self.loaded_model_idx = self.model_idx
         dev = self.model.device
-        self.status = f"Ready on {dev} (model loaded in {elapsed:.1f}s)"
+        self.status = f"Ready on {dev} (loaded in {elapsed:.1f}s)"
         self._needs_redraw = True
+
+    def _ready_status(self):
+        if self.model:
+            return f"Ready on {self.model.device}"
+        return "Ready"
 
     def _audio_callback(self, indata, frames, time_info, status):
         self._chunks.append(indata.copy())
@@ -350,7 +371,7 @@ class SpeechToType:
             callback=self._audio_callback,
         )
         self._stream.start()
-        if self.deafen_while_recording:
+        if self.deafen_while_recording != "off":
             self._mute_system()
         self.status = "Recording..."
         self._needs_redraw = True
@@ -369,11 +390,11 @@ class SpeechToType:
         if self.icon:
             self.icon.icon = self.create_icon_image("green")
 
-        if self.deafen_while_recording:
+        if self.deafen_while_recording != "off":
             self._unmute_system()
 
         if not self._chunks:
-            self.status = "Ready"
+            self.status = self._ready_status()
             self._needs_redraw = True
             return
 
@@ -410,7 +431,7 @@ class SpeechToType:
             self.status = "Typed without Enter (cancel+type)"
             self._cancel_type_used = False
         else:
-            self.status = "Ready"
+            self.status = self._ready_status()
         self._needs_redraw = True
 
         if self.window_target == "active":
@@ -507,8 +528,10 @@ class SpeechToType:
             else:
                 return "Types into whatever window is active when transcription finishes. The target may change if you switch apps."
         elif selected == 9:
-            if self.deafen_while_recording:
-                return "System audio will be deafened (muted) while recording and restored when you stop. Prevents your speakers from being picked up by the mic."
+            if self.deafen_while_recording == "on":
+                return "System audio will be fully muted while recording and restored when you stop. Prevents your speakers from being picked up by the mic."
+            elif self.deafen_while_recording == "half":
+                return "System audio volume will be reduced by 50% while recording and restored when you stop. Reduces speaker bleed without losing all audio."
             else:
                 return "System audio stays on during recording. Enable this if your microphone picks up sounds from your speakers."
         return ""
@@ -635,7 +658,8 @@ class SpeechToType:
         # Deafen while recording
         prefix = "> " if selected == 9 else "  "
         attr = curses.A_REVERSE if selected == 9 else 0
-        deafen_label = "On" if self.deafen_while_recording else "Off"
+        deafen_labels = {"off": "Off", "half": "50%", "on": "On"}
+        deafen_label = deafen_labels.get(self.deafen_while_recording, "Off")
         safe_addstr(11, 0, f"{prefix}Deafen on Rec: ", curses.A_BOLD if selected == 9 else 0)
         safe_addstr(11, 17, f" < {deafen_label} > ", attr)
 
@@ -753,7 +777,13 @@ class SpeechToType:
                 elif selected == 8:
                     self.window_target = "active" if self.window_target == "original" else "original"
                 elif selected == 9:
-                    self.deafen_while_recording = not self.deafen_while_recording
+                    deafen_options = ["off", "half", "on"]
+                    cur = deafen_options.index(self.deafen_while_recording) if self.deafen_while_recording in deafen_options else 0
+                    if key == curses.KEY_LEFT:
+                        cur = (cur - 1) % len(deafen_options)
+                    else:
+                        cur = (cur + 1) % len(deafen_options)
+                    self.deafen_while_recording = deafen_options[cur]
                 self._save_settings()
             elif key == 10 or key == curses.KEY_ENTER:  # Enter
                 if selected == 2:
