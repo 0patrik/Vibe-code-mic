@@ -85,6 +85,7 @@ class SpeechToType:
         self._prev_volume = None
         self._skip_enter = False
         self._cancel_type_used = False
+        self._record_start_time = None
 
         # UI state
         self.status = "Loading model..."
@@ -283,6 +284,9 @@ class SpeechToType:
 
     def _audio_callback(self, indata, frames, time_info, status):
         self._chunks.append(indata.copy())
+        # Auto-stop at 30s (Whisper's max input length)
+        if self._record_start_time and (time.perf_counter() - self._record_start_time) >= 30.0:
+            threading.Thread(target=self._stop_recording, daemon=True).start()
 
     def _hook_hotkey(self):
         if self.hotkey:
@@ -325,6 +329,7 @@ class SpeechToType:
     def _on_cancel_event(self, e):
         if e.event_type == "down" and self._recording:
             self._recording = False
+            self._record_start_time = None
             if self._stream:
                 self._stream.stop()
                 self._stream.close()
@@ -371,9 +376,10 @@ class SpeechToType:
             callback=self._audio_callback,
         )
         self._stream.start()
+        self._record_start_time = time.perf_counter()
         if self.deafen_while_recording != "off":
             self._mute_system()
-        self.status = "Recording..."
+        self.status = "Recording... 0.0s / 30s"
         self._needs_redraw = True
         if self.icon:
             self.icon.icon = self.create_icon_image("red")
@@ -382,6 +388,7 @@ class SpeechToType:
         if not self._recording:
             return
         self._recording = False
+        self._record_start_time = None
         if self._stream:
             self._stream.stop()
             self._stream.close()
@@ -672,18 +679,24 @@ class SpeechToType:
         safe_addstr(help_y, 0, "  Up/Down: navigate | Left/Right: change | Ctrl+C: quit")
 
         # Status with color (word-wrapped, grows upward from help line)
-        if "Recording" in self.status:
+        # Update recording timer live
+        display_status = self.status
+        if self._recording and self._record_start_time is not None:
+            elapsed = time.perf_counter() - self._record_start_time
+            display_status = f"Recording... {elapsed:.1f}s / 30s"
+
+        if "Recording" in display_status:
             status_color = curses.color_pair(2) | curses.A_BOLD
-        elif "Transcribing" in self.status:
+        elif "Transcribing" in display_status:
             status_color = curses.color_pair(3) | curses.A_BOLD
-        elif "Quitting" in self.status:
+        elif "Quitting" in display_status:
             status_color = curses.color_pair(3) | curses.A_BOLD
-        elif "Ready" in self.status:
+        elif "Ready" in display_status:
             status_color = curses.color_pair(1)
         else:
             status_color = curses.color_pair(4)
         model_label = MODELS[self.loaded_model_idx] if self.loaded_model_idx is not None else "none"
-        status_text = f"{self.status}  [model: {model_label}]"
+        status_text = f"{display_status}  [model: {model_label}]"
         status_avail = w - 10 - 1
         status_lines = wrap_text(status_text, status_avail)
         status_line_count = max(len(status_lines), 1)
