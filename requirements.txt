@@ -1,12 +1,10 @@
---extra-index-url https://download.pytorch.org/whl/cu124
 torch
 torchaudio
 openai-whisper
 sounddevice
 numpy
-keyboard
+pynput
 pystray
 Pillow
-windows-curses
 json5
-pycaw
+pyobjc-framework-Cocoa

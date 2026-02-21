@@ -1,13 +1,19 @@
 # vibe-code-mic
 
-Local speech-to-text that types into whichever window you had active when starting. Uses OpenAI Whisper. Windows only. Designed claude code use case in mind.
+Local speech-to-text that types into whichever window you had active when starting. Uses OpenAI Whisper. macOS port. Designed with Claude Code use case in mind.
+
+### Prerequisites
+
+- macOS
+- Python 3.9+
+- **Accessibility permissions**: The app needs Accessibility access to listen for global hotkeys and type text. Go to **System Settings > Privacy & Security > Accessibility** and add your terminal app (e.g. Terminal, iTerm2).
 
 ### Install
 
 ```bash
 # Create and activate virtual environment
-python -m venv venv
-venv\Scripts\activate
+python3 -m venv venv
+source venv/bin/activate
 
 # Install all dependencies
 pip install -r requirements.txt
@@ -17,7 +23,7 @@ pip install -r requirements.txt
 
 ```bash
 # Activate virtual environment (if not already active)
-venv\Scripts\activate
+source venv/bin/activate
 
 # Start the app
 python app.py
@@ -25,22 +31,23 @@ python app.py
 
 ### Features / options
 - Fully local — no data sent to the cloud
-- Sends "enter key" at the end (optimal for claude code)
-- Support typing into an unfocused window
+- Sends "enter key" at the end (optimal for Claude Code)
+- Support typing into an unfocused window (re-activates the original app)
 - Configurable hotkey, mode, device, and model
 - Deafen system audio while recording
 - Interactive TUI for settings
 - Settings persist as JSON5
-- CUDA acceleration
+- Apple Silicon (MPS) acceleration when available
 
-### GPU acceleration (CUDA)
+### GPU acceleration (Apple Silicon / MPS)
 
-The default install includes CUDA-enabled PyTorch. If you have an NVIDIA GPU, the app auto-detects it and uses GPU acceleration — the status line will show `Ready on cuda:0`. No extra setup needed. Without a GPU, it falls back to CPU automatically.
+On Apple Silicon Macs, the app auto-detects MPS and uses GPU acceleration — the status line will show `Ready on mps`. On Intel Macs, it falls back to CPU automatically.
 
 ### Limitations
 - No real-time typing; text appears after recording stops
-- Windows only
+- macOS only (this fork)
 - 30-second max clip length (Whisper limit)
+- Requires Accessibility permissions for global hotkeys and typing
 
 ### CLI flags
 
