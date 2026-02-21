@@ -26,7 +26,11 @@ import sounddevice as sd
 import mlx_whisper
 
 import AppKit
+from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
 import Quartz
+
+# Prevent the app from showing a bouncing icon in the Dock
+NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 from Quartz import (
     CGEventCreateKeyboardEvent,
     CGEventPost,
@@ -98,6 +102,40 @@ MLX_MODEL_REPOS = {
 }
 SAMPLE_RATE = 16000
 DEFAULT_SETTINGS_PATH = "./settings.json5"
+
+# ── Timing & threshold constants ─────────────────────────────────
+MAX_RECORDING_DURATION = 30.0        # seconds - auto-stop recording
+MIN_AUDIO_DURATION = 0.3             # seconds - skip if shorter
+
+# Paste/type workflow timing (seconds)
+PASTE_KEY_DOWN_DELAY = 0.05          # after Cmd+V key down
+PASTE_PRE_ENTER_DELAY = 0.10         # before pressing Enter
+ENTER_KEY_DOWN_DELAY = 0.05          # after Enter key down
+PASTE_SETTLE_DELAY = 0.20            # wait for paste to be consumed
+SWITCH_BACK_DELAY = 0.10             # after switching back to original app
+PRE_REPLAY_DELAY = 0.05              # before replaying captured keystrokes
+KEYSTROKE_REPLAY_INTERVAL = 0.008    # between each replayed keystroke
+
+# Window switch polling
+WINDOW_SWITCH_POLL_INTERVAL = 0.050  # CFRunLoop pump per poll iteration
+WINDOW_SWITCH_MAX_POLLS = 20         # max iterations waiting for app switch
+POST_SWITCH_SETTLE = 0.050           # settle after confirming switch
+
+# CFRunLoop pump internals
+PUMP_INTERVAL = 0.010                # CFRunLoop iteration length
+PUMP_SLEEP = 0.005                   # sleep between pump iterations
+
+# Event capture
+MAX_CAPTURED_EVENTS = 256            # buffer limit for captured keystrokes
+
+# Key rebinding
+REBIND_POLL_INTERVAL = 0.1           # seconds between checks
+REBIND_TIMEOUT_POLLS = 100           # max iterations (10s total)
+
+# UI
+CURSES_INPUT_TIMEOUT_MS = 100        # getch timeout
+MAIN_LOOP_PUMP_DURATION = 0.01       # CFRunLoop pump in main loop
+QUIT_DELAY = 0.3                     # pause before quitting
 
 
 def get_input_devices():
@@ -365,7 +403,7 @@ class SpeechToType:
             event_source_id = CGEventGetIntegerValueField(event, 45)  # kCGEventSourceStateID
             if event_source_id == self._paste_source_state_id:
                 return event
-            if len(self._captured_events) < 256:
+            if len(self._captured_events) < MAX_CAPTURED_EVENTS:
                 self._captured_events.append(CGEventCreateCopy(event))
             return None  # suppress
 
@@ -476,7 +514,7 @@ class SpeechToType:
 
     def _audio_callback(self, indata, frames, time_info, status):
         self._chunks.append(indata.copy())
-        if self._record_start_time and (time.perf_counter() - self._record_start_time) >= 30.0:
+        if self._record_start_time and (time.perf_counter() - self._record_start_time) >= MAX_RECORDING_DURATION:
             threading.Thread(target=self._stop_recording, daemon=True).start()
 
     def _on_hotkey_event(self, direction):
@@ -552,7 +590,7 @@ class SpeechToType:
         self._record_start_time = time.perf_counter()
         if self.deafen_while_recording != "off":
             self._mute_system()
-        self.status = "Recording... 0.0s / 30s"
+        self.status = f"Recording... 0.0s / {MAX_RECORDING_DURATION:.0f}s"
         self._needs_redraw = True
 
     def _stop_recording(self):
@@ -576,7 +614,7 @@ class SpeechToType:
         audio = np.concatenate(self._chunks, axis=0).flatten()
         duration = len(audio) / SAMPLE_RATE
 
-        if duration < 0.3:
+        if duration < MIN_AUDIO_DURATION:
             self.status = "Too short, skipped"
             self._needs_redraw = True
             return
@@ -643,10 +681,14 @@ class SpeechToType:
         self._captured_events.clear()
         self._paste_capturing = True
 
-        # Only switch windows if the target is a different app
+        # Switch to target app/window if needed
         target_pid = target_app.processIdentifier()
         front = workspace.frontmostApplication()
-        needs_switch = not (front and front.processIdentifier() == target_pid)
+        same_app = front and front.processIdentifier() == target_pid
+        needs_switch = not same_app
+
+        # Even within the same app, raise the target window if it differs
+        needs_window_raise = same_app and target_window_ref and target_window_ref != return_to_window_ref
 
         if needs_switch:
             target_app_ref, _ = get_ax_focused_window(target_pid)
@@ -655,12 +697,17 @@ class SpeechToType:
                 ax_raise_window(target_window_ref)
                 if target_app_ref:
                     ax_set_focused_window(target_app_ref, target_window_ref)
-            for _ in range(20):
-                CFRunLoopRunInMode(_rl, 0.050, False)
+            for _ in range(WINDOW_SWITCH_MAX_POLLS):
+                CFRunLoopRunInMode(_rl, WINDOW_SWITCH_POLL_INTERVAL, False)
                 front = workspace.frontmostApplication()
                 if front and front.processIdentifier() == target_pid:
                     break
-        CFRunLoopRunInMode(_rl, 0.050, False)
+        elif needs_window_raise:
+            target_app_ref, _ = get_ax_focused_window(target_pid)
+            ax_raise_window(target_window_ref)
+            if target_app_ref:
+                ax_set_focused_window(target_app_ref, target_window_ref)
+        CFRunLoopRunInMode(_rl, POST_SWITCH_SETTLE, False)
 
         # Pump the run loop for a given duration while capturing keystrokes.
         # Single CFRunLoopRunInMode calls return instantly after CGEventPost,
@@ -668,47 +715,48 @@ class SpeechToType:
         def _pump(seconds):
             deadline = time.monotonic() + seconds
             while time.monotonic() < deadline:
-                CFRunLoopRunInMode(_rl, 0.010, False)
+                CFRunLoopRunInMode(_rl, PUMP_INTERVAL, False)
                 remaining = deadline - time.monotonic()
-                if remaining > 0.005:
-                    time.sleep(0.005)
+                if remaining > PUMP_SLEEP:
+                    time.sleep(PUMP_SLEEP)
 
         # Paste (Cmd+V)
         down = CGEventCreateKeyboardEvent(src, 0x09, True)
         CGEventSetFlags(down, kCGEventFlagMaskCommand)
         CGEventPost(kCGHIDEventTap, down)
-        _pump(0.05)
+        _pump(PASTE_KEY_DOWN_DELAY)
         up = CGEventCreateKeyboardEvent(src, 0x09, False)
         CGEventSetFlags(up, kCGEventFlagMaskCommand)
         CGEventPost(kCGHIDEventTap, up)
 
         # Optionally press Enter
         if self.after_action == "enter" and not self._skip_enter:
-            _pump(0.10)
+            _pump(PASTE_PRE_ENTER_DELAY)
             down = CGEventCreateKeyboardEvent(src, 0x24, True)
             CGEventPost(kCGHIDEventTap, down)
-            _pump(0.05)
+            _pump(ENTER_KEY_DOWN_DELAY)
             up = CGEventCreateKeyboardEvent(src, 0x24, False)
             CGEventPost(kCGHIDEventTap, up)
 
         # Wait for paste to be consumed
-        _pump(0.20)
+        _pump(PASTE_SETTLE_DELAY)
 
-        # Switch back (only if we switched away)
-        if needs_switch and return_to_app:
-            return_to_app.activateWithOptions_(0)
+        # Switch back (only if we switched away from the original app/window)
+        if (needs_switch or needs_window_raise) and return_to_app:
+            if needs_switch:
+                return_to_app.activateWithOptions_(0)
             if return_to_window_ref:
                 ax_raise_window(return_to_window_ref)
                 if return_to_app_ref:
                     ax_set_focused_window(return_to_app_ref, return_to_window_ref)
-            _pump(0.10)
+            _pump(SWITCH_BACK_DELAY)
 
         # Stop capturing and replay buffered keystrokes
         self._paste_capturing = False
-        _pump(0.05)
+        _pump(PRE_REPLAY_DELAY)
         for evt in self._captured_events:
             CGEventPost(kCGHIDEventTap, evt)
-            time.sleep(0.008)
+            time.sleep(KEYSTROKE_REPLAY_INTERVAL)
         self._captured_events.clear()
 
     # ── Descriptions ────────────────────────────────────────
@@ -898,7 +946,7 @@ class SpeechToType:
         display_status = self.status
         if self._recording and self._record_start_time is not None:
             elapsed = time.perf_counter() - self._record_start_time
-            display_status = f"Recording... {elapsed:.1f}s / 30s"
+            display_status = f"Recording... {elapsed:.1f}s / {MAX_RECORDING_DURATION:.0f}s"
 
         if "Recording" in display_status:
             status_color = curses.color_pair(2) | curses.A_BOLD
@@ -975,8 +1023,8 @@ class SpeechToType:
         CGEventTapEnable(rebind_tap, True)
 
         # Wait until the main thread's pump fires the callback (timeout 10s)
-        for _ in range(100):
-            time.sleep(0.1)
+        for _ in range(REBIND_TIMEOUT_POLLS):
+            time.sleep(REBIND_POLL_INTERVAL)
             if captured["done"]:
                 break
 
@@ -1004,7 +1052,7 @@ class SpeechToType:
     def run_curses(self, stdscr):
         curses.curs_set(0)
         stdscr.nodelay(True)
-        stdscr.timeout(100)
+        stdscr.timeout(CURSES_INPUT_TIMEOUT_MS)
         curses.start_color()
         curses.use_default_colors()
         curses.init_pair(1, curses.COLOR_GREEN, -1)   # ready
@@ -1021,7 +1069,7 @@ class SpeechToType:
 
         while self._running:
             # Pump the CFRunLoop so CGEvent tap callbacks fire
-            self._pump_runloop(0.01)
+            self._pump_runloop(MAIN_LOOP_PUMP_DURATION)
 
             self.draw_ui(stdscr, selected, rebinding)
             self._needs_redraw = False
@@ -1032,7 +1080,7 @@ class SpeechToType:
                 self.status = "Quitting..."
                 self.draw_ui(stdscr, selected, rebinding)
                 stdscr.refresh()
-                time.sleep(0.3)
+                time.sleep(QUIT_DELAY)
                 break
             except Exception:
                 key = -1
