@@ -1,58 +1,74 @@
 # vibe-code-mic
 
-Local speech-to-text that types into whichever window you had active when starting. Uses OpenAI Whisper. macOS port. Designed with Claude Code use case in mind.
+Local speech-to-text that types into whichever window you had active when starting. Uses OpenAI Whisper. Designed with Claude Code use case in mind.
 
-### Prerequisites
+## Platform support
 
-- macOS
+| Platform | Entry point | Whisper backend | GPU acceleration |
+|----------|-------------|-----------------|------------------|
+| macOS (Apple Silicon) | `python3 app_mac.py` | [mlx-whisper](https://github.com/ml-explore/mlx-examples) | MLX (automatic) |
+| Windows | `python app_win.py` | openai-whisper + torch | CUDA (if available) |
+
+### macOS requirements
+
+- macOS 13+ (Ventura or later), Apple Silicon
 - Python 3.9+
-- **Accessibility permissions**: The app needs Accessibility access to listen for global hotkeys and type text. Go to **System Settings > Privacy & Security > Accessibility** and add your terminal app (e.g. Terminal, iTerm2).
+- **Accessibility permissions**: System Settings > Privacy & Security > Accessibility — add your terminal app (Terminal, iTerm2, etc.)
 
-### Install
+### Windows requirements
+
+- Windows 10+
+- Python 3.9+
+
+## Install
 
 ```bash
-# Create and activate virtual environment
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate  # Windows: venv\Scripts\activate
 
-# Install all dependencies
+# macOS (Apple Silicon)
+pip install mlx-whisper numpy sounddevice json5 \
+    pyobjc-framework-Cocoa pyobjc-framework-Quartz \
+    pyobjc-framework-ApplicationServices
+
+# Windows
 pip install -r requirements.txt
 ```
 
-### Run
+## Run
 
 ```bash
-# Activate virtual environment (if not already active)
-source venv/bin/activate
+source venv/bin/activate  # Windows: venv\Scripts\activate
 
-# Start the app
-python app.py
+# macOS
+python3 app_mac.py
+
+# Windows
+python app_win.py
 ```
 
-### Features / options
+## Features
+
 - Fully local — no data sent to the cloud
-- Sends "enter key" at the end (optimal for Claude Code)
-- Support typing into an unfocused window (re-activates the original app)
+- Sends Enter after typing (optimal for Claude Code)
+- Types into the window that was focused when recording started
+- Menu bar countdown timer while recording (macOS)
+- Clipboard preserved after paste
 - Configurable hotkey, mode, device, and model
 - Deafen system audio while recording
-- Interactive TUI for settings
-- Settings persist as JSON5
-- Apple Silicon (MPS) acceleration when available
+- Interactive TUI for settings (persisted as JSON5)
 
-### GPU acceleration (Apple Silicon / MPS)
+## Limitations
 
-On Apple Silicon Macs, the app auto-detects MPS and uses GPU acceleration — the status line will show `Ready on mps`. On Intel Macs, it falls back to CPU automatically.
+- No real-time streaming; text appears after recording stops
+- 30-second max clip length
+- macOS version requires Accessibility permissions
 
-### Limitations
-- No real-time typing; text appears after recording stops
-- macOS only (this fork)
-- 30-second max clip length (Whisper limit)
-- Requires Accessibility permissions for global hotkeys and typing
+## CLI flags
 
-### CLI flags
-
-Run `python app.py --help` for all options. Use `--settings` / `-s` to point to a different JSON5 settings file:
+Run with `--help` for all options:
 
 ```
-python app.py --settings ./settings.json5
+python3 app_mac.py --help
+python app_win.py --help
 ```
