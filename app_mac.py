@@ -53,7 +53,7 @@ from Quartz import (
     kCGEventSourceStatePrivate,
 )
 from Foundation import NSRunLoop, NSDate, CFRunLoopGetCurrent, CFRunLoopRunInMode
-from AppKit import NSPasteboardTypeString
+from AppKit import NSPasteboardTypeString, NSStatusBar, NSVariableStatusItemLength, NSFont
 import CoreFoundation
 import ApplicationServices
 
@@ -112,6 +112,7 @@ PASTE_KEY_DOWN_DELAY = 0.05          # after Cmd+V key down
 PASTE_PRE_ENTER_DELAY = 0.10         # before pressing Enter
 ENTER_KEY_DOWN_DELAY = 0.05          # after Enter key down
 PASTE_SETTLE_DELAY = 0.20            # wait for paste to be consumed
+CLIPBOARD_RESTORE_DELAY = 0.30       # extra wait before restoring clipboard
 SWITCH_BACK_DELAY = 0.10             # after switching back to original app
 PRE_REPLAY_DELAY = 0.05              # before replaying captured keystrokes
 KEYSTROKE_REPLAY_INTERVAL = 0.008    # between each replayed keystroke
@@ -242,6 +243,13 @@ class SpeechToType:
         self._paste_capturing = False
         self._paste_source_state_id = 0
         self._captured_events = []
+
+        # Menu bar status item for recording timer
+        self._status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
+        self._status_item.button().setFont_(NSFont.monospacedDigitSystemFontOfSize_weight_(12, 0.0))
+        self._status_item.button().setTitle_("")
+        self._status_item_visible = False
+        self._update_menu_bar("")  # hidden initially
 
         # Configurable settings
         self.input_devices = get_input_devices()
@@ -484,6 +492,27 @@ class SpeechToType:
         # This must run on the main thread (where curses loop runs)
         CFRunLoopRunInMode(CoreFoundation.kCFRunLoopDefaultMode, seconds, False)
 
+    # ── Menu bar timer ─────────────────────────────────────
+
+    def _update_menu_bar(self, text):
+        """Show or hide the menu bar status item."""
+        if text:
+            self._status_item.setVisible_(True)
+            self._status_item.button().setTitle_(text)
+            self._status_item_visible = True
+        else:
+            self._status_item.setVisible_(False)
+            self._status_item_visible = False
+
+    def _tick_menu_bar(self):
+        """Update menu bar timer if recording, hide otherwise."""
+        if self._recording and self._record_start_time is not None:
+            elapsed = time.perf_counter() - self._record_start_time
+            remaining = max(0, MAX_RECORDING_DURATION - elapsed)
+            self._update_menu_bar(f"\U0001F534 {remaining:.0f}s")
+        elif self._status_item_visible:
+            self._update_menu_bar("")
+
     # ── Core logic ──────────────────────────────────────────
 
     def load_model(self):
@@ -670,8 +699,10 @@ class SpeechToType:
         if not target_app:
             return
 
-        # Set clipboard to transcription text
+        # Save current clipboard and set it to transcription text
         pb = AppKit.NSPasteboard.generalPasteboard()
+        old_change_count = pb.changeCount()
+        old_clipboard = pb.stringForType_(NSPasteboardTypeString)
         pb.clearContents()
         pb.setString_forType_(text, NSPasteboardTypeString)
 
@@ -758,6 +789,12 @@ class SpeechToType:
             CGEventPost(kCGHIDEventTap, evt)
             time.sleep(KEYSTROKE_REPLAY_INTERVAL)
         self._captured_events.clear()
+
+        # Restore original clipboard after everything has settled
+        if old_clipboard is not None:
+            _pump(CLIPBOARD_RESTORE_DELAY)
+            pb.clearContents()
+            pb.setString_forType_(old_clipboard, NSPasteboardTypeString)
 
     # ── Descriptions ────────────────────────────────────────
 
@@ -1071,6 +1108,7 @@ class SpeechToType:
             # Pump the CFRunLoop so CGEvent tap callbacks fire
             self._pump_runloop(MAIN_LOOP_PUMP_DURATION)
 
+            self._tick_menu_bar()
             self.draw_ui(stdscr, selected, rebinding)
             self._needs_redraw = False
 
@@ -1160,6 +1198,7 @@ class SpeechToType:
         self._save_settings()
         self._running = False
         self._uninstall_hotkey_tap()
+        NSStatusBar.systemStatusBar().removeStatusItem_(self._status_item)
 
     def run(self):
         curses.wrapper(self.run_curses)
