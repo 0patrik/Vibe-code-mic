@@ -252,6 +252,7 @@ class SpeechToType:
         self.loaded_model_idx = None
         self._key_held = False
         self._recording = False
+        self._recording_lock = threading.Lock()
         self._chunks = []
         self._stream = None
 
@@ -639,23 +640,30 @@ class SpeechToType:
             self._target_app_ref, self._target_window_ref = get_ax_focused_window(pid)
 
     def _start_recording(self):
-        if self._recording:
-            return
-        self._recording = True
+        with self._recording_lock:
+            if self._recording:
+                return
+            self._recording = True
         self._skip_enter = False
         self._chunks = []
 
         self._capture_target_window()
 
-        dev_index = self.input_devices[self.device_idx][0] if self.input_devices else None
-        self._stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            device=dev_index,
-            callback=self._audio_callback,
-        )
-        self._stream.start()
+        try:
+            dev_index = self.input_devices[self.device_idx][0] if self.input_devices else None
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                device=dev_index,
+                callback=self._audio_callback,
+            )
+            self._stream.start()
+        except Exception as e:
+            self._recording = False
+            self.status = f"Recording failed: {e}"
+            self._needs_redraw = True
+            return
         self._record_start_time = time.perf_counter()
         if self.deafen_while_recording != "off":
             self._mute_system()
@@ -663,9 +671,10 @@ class SpeechToType:
         self._needs_redraw = True
 
     def _stop_recording(self):
-        if not self._recording:
-            return
-        self._recording = False
+        with self._recording_lock:
+            if not self._recording:
+                return
+            self._recording = False
         self._record_start_time = None
         if self._stream:
             self._stream.stop()
