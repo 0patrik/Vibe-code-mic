@@ -1,0 +1,10 @@
+# Windows dependencies for app_win.py
+torch==2.10.0
+torchaudio
+openai-whisper==20250625
+sounddevice==0.5.5
+numpy==2.3.5
+json5==0.13.0
+pynput
+pystray
+Pillow==12.0.0

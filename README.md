@@ -27,12 +27,10 @@ python3 -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 
 # macOS (Apple Silicon)
-pip install mlx-whisper numpy sounddevice json5 \
-    pyobjc-framework-Cocoa pyobjc-framework-Quartz \
-    pyobjc-framework-ApplicationServices
+pip install -r requirements-mac.txt
 
 # Windows
-pip install -r requirements.txt
+pip install -r requirements-win.txt
 ```
 
 ## Run

@@ -1,0 +1,8 @@
+# macOS (Apple Silicon) dependencies for app_mac.py
+mlx-whisper==0.4.3
+sounddevice==0.5.5
+numpy==2.3.5
+json5==0.13.0
+pyobjc-framework-Cocoa==12.1
+pyobjc-framework-Quartz==12.1
+pyobjc-framework-ApplicationServices==12.1

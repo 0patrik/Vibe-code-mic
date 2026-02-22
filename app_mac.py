@@ -4,13 +4,36 @@ vibe-code-mic Desktop App (macOS)
 Interactive console UI with configurable hotkey, mode, and audio device.
 Hold (or toggle) a key to record speech, transcribes and types it out.
 
-Uses macOS CGEvent/AXUIElement APIs for window targeting and text input.
-Requires Accessibility permissions for the terminal app.
+Security model
+--------------
+Permissions required:
+  - Accessibility (System Settings > Privacy & Security) — used for the
+    CGEvent tap that listens for the global hotkey and for AXUIElement
+    calls that read/raise other applications' windows during paste.
+  - Microphone — used to record audio while the hotkey is held/toggled.
 
-Requires:
-    pip install pyobjc-framework-Cocoa pyobjc-framework-Quartz \
-                pyobjc-framework-ApplicationServices \
-                mlx-whisper numpy sounddevice json5
+What the app captures and when:
+  - Audio: only while the user is actively recording (hotkey held/toggled).
+  - Keystrokes: intercepted *only* during the ~0.5 s paste window so they
+    can be replayed afterwards.  Outside that window the event tap only
+    inspects the hotkey/cancel key codes and passes everything else through.
+
+What the app does NOT do:
+  - No keystroke logging — non-hotkey keystrokes are never stored or read.
+  - No network access — all transcription runs locally via mlx-whisper.
+  - No disk writes except the JSON5 settings file.
+
+Data flow:
+  record audio → transcribe locally (mlx-whisper) → copy to clipboard →
+  switch to target window → Cmd+V paste → (optional Enter) → switch back →
+  replay buffered keystrokes → restore original clipboard.
+
+External processes:
+  - ``osascript`` is invoked for system volume get/set/mute only, with
+    hardcoded AppleScript one-liners (no user-controlled arguments).
+
+Sections that touch privileged macOS APIs are marked with
+``# ~~~ SECURITY-SENSITIVE ~~~`` so reviewers can grep for them.
 """
 
 import sys
@@ -149,7 +172,8 @@ def get_input_devices():
     return result
 
 
-# ── macOS window helpers (verified working from test_type.py) ───────
+# ── macOS window helpers ── # ~~~ SECURITY-SENSITIVE ~~~
+# These functions use AXUIElement to read and manipulate other apps' windows.
 
 def get_ax_focused_window(pid):
     """Get the focused window AXUIElement for a given PID."""
@@ -184,7 +208,8 @@ def ax_set_focused_window(app_ref, window_ref):
     )
 
 
-# ── macOS volume control via osascript ──────────────────────────────
+# ── macOS volume control via osascript ── # ~~~ SECURITY-SENSITIVE ~~~
+# Invokes osascript subprocess with hardcoded AppleScript commands only.
 
 def get_system_volume():
     """Get current system output volume (0-100) and mute state."""
@@ -203,6 +228,7 @@ def get_system_volume():
 
 
 def set_system_volume(volume):
+    """Set macOS system output volume via osascript (hardcoded command)."""
     subprocess.run(
         ["osascript", "-e", f"set volume output volume {volume}"],
         stderr=subprocess.DEVNULL,
@@ -210,6 +236,7 @@ def set_system_volume(volume):
 
 
 def set_system_mute(muted):
+    """Set macOS system mute state via osascript (hardcoded command)."""
     val = "true" if muted else "false"
     subprocess.run(
         ["osascript", "-e", f"set volume output muted {val}"],
@@ -397,10 +424,18 @@ class SpeechToType:
             self.status = f"Undeafen error: {e}"
             self._needs_redraw = True
 
-    # ── macOS global hotkey via CGEvent tap ──────────────────
+    # ── macOS global hotkey via CGEvent tap ── # ~~~ SECURITY-SENSITIVE ~~~
+    # Installs a global CGEvent tap that intercepts keyboard events.
+    # Only hotkey/cancel key codes are inspected; all other keys pass through
+    # except during the brief paste-capture window.
 
     def _hotkey_callback(self, proxy, event_type, event, user_info):
-        """CGEvent tap callback for global hotkey monitoring."""
+        """CGEvent tap callback — intercepts global keyboard events.
+
+        Security: inspects only hotkey/cancel key codes and passes all other
+        keys through unmodified.  During the ~0.5 s paste window, non-synthetic
+        keystrokes are buffered (not logged) and replayed immediately after.
+        """
         if event_type in (kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput):
             if self._tap_port is not None:
                 CGEventTapEnable(self._tap_port, True)
@@ -451,6 +486,11 @@ class SpeechToType:
         return event
 
     def _install_hotkey_tap(self):
+        """Create and install the global CGEvent tap on the main run loop.
+
+        Security: requires Accessibility permission; taps all key-down,
+        key-up, and flags-changed events system-wide.
+        """
         self._uninstall_hotkey_tap()
 
         tap_mask = (1 << kCGEventKeyDown) | (1 << kCGEventKeyUp) | (1 << kCGEventFlagsChanged)
@@ -676,11 +716,20 @@ class SpeechToType:
 
         self._type_text_into_target(text)
 
-    def _type_text_into_target(self, text):
-        """Paste text into the target window via Cmd+V, then switch back."""
-        _rl = CoreFoundation.kCFRunLoopDefaultMode
+    # ── Paste workflow ── # ~~~ SECURITY-SENSITIVE ~~~
+    # Reads/writes system clipboard, posts synthetic keyboard events,
+    # activates other apps' windows, and briefly captures keystrokes.
 
-        # Capture the currently focused window as "return-to" before switching
+    def _resolve_paste_targets(self):
+        """Determine the return-to and paste-into windows.
+
+        Security: reads the frontmost application identity and its focused
+        window via AXUIElement.
+
+        Returns (workspace, return_to_app, return_to_app_ref,
+                 return_to_window_ref, target_app, target_window_ref)
+        or None if there is no valid target.
+        """
         workspace = AppKit.NSWorkspace.sharedWorkspace()
         return_to_app = workspace.frontmostApplication()
         return_to_app_ref = None
@@ -689,7 +738,6 @@ class SpeechToType:
             rt_pid = return_to_app.processIdentifier()
             return_to_app_ref, return_to_window_ref = get_ax_focused_window(rt_pid)
 
-        # Resolve the paste target
         if self.window_target == "active":
             target_app = return_to_app
             target_window_ref = return_to_window_ref
@@ -697,29 +745,40 @@ class SpeechToType:
             target_app = self._target_app
             target_window_ref = self._target_window_ref
         if not target_app:
-            return
+            return None
 
-        # Save current clipboard and set it to transcription text
+        return (workspace, return_to_app, return_to_app_ref,
+                return_to_window_ref, target_app, target_window_ref)
+
+    def _save_and_set_clipboard(self, text):
+        """Save old clipboard contents and set clipboard to *text*.
+
+        Security: reads and writes the system clipboard.
+
+        Returns (pb, old_clipboard) for later restoration.
+        """
         pb = AppKit.NSPasteboard.generalPasteboard()
-        old_change_count = pb.changeCount()
         old_clipboard = pb.stringForType_(NSPasteboardTypeString)
         pb.clearContents()
         pb.setString_forType_(text, NSPasteboardTypeString)
+        return pb, old_clipboard
 
-        # Create a private event source and start keystroke capture
-        src = CGEventSourceCreate(kCGEventSourceStatePrivate)
-        self._paste_source_state_id = CGEventSourceGetSourceStateID(src)
-        self._captured_events.clear()
-        self._paste_capturing = True
+    def _switch_to_target_window(self, workspace, target_app, target_window_ref,
+                                  return_to_window_ref):
+        """Activate the target app/window, waiting for the switch to complete.
 
-        # Switch to target app/window if needed
+        Security: activates a cross-process window and polls until the OS
+        confirms the switch.
+
+        Returns (needs_switch, needs_window_raise).
+        """
+        _rl = CoreFoundation.kCFRunLoopDefaultMode
         target_pid = target_app.processIdentifier()
         front = workspace.frontmostApplication()
         same_app = front and front.processIdentifier() == target_pid
         needs_switch = not same_app
-
-        # Even within the same app, raise the target window if it differs
-        needs_window_raise = same_app and target_window_ref and target_window_ref != return_to_window_ref
+        needs_window_raise = (same_app and target_window_ref
+                              and target_window_ref != return_to_window_ref)
 
         if needs_switch:
             target_app_ref, _ = get_ax_focused_window(target_pid)
@@ -740,39 +799,42 @@ class SpeechToType:
                 ax_set_focused_window(target_app_ref, target_window_ref)
         CFRunLoopRunInMode(_rl, POST_SWITCH_SETTLE, False)
 
-        # Pump the run loop for a given duration while capturing keystrokes.
-        # Single CFRunLoopRunInMode calls return instantly after CGEventPost,
-        # so we loop with short iterations that add up to the desired wait.
-        def _pump(seconds):
-            deadline = time.monotonic() + seconds
-            while time.monotonic() < deadline:
-                CFRunLoopRunInMode(_rl, PUMP_INTERVAL, False)
-                remaining = deadline - time.monotonic()
-                if remaining > PUMP_SLEEP:
-                    time.sleep(PUMP_SLEEP)
+        return needs_switch, needs_window_raise
 
+    def _paste_and_enter(self, src):
+        """Post synthetic Cmd+V and (optionally) Enter key events.
+
+        Security: posts synthetic keyboard events into the active application
+        via CGEventPost.  Key codes 0x09 (V) and 0x24 (Return) are macOS
+        API constants.
+        """
         # Paste (Cmd+V)
         down = CGEventCreateKeyboardEvent(src, 0x09, True)
         CGEventSetFlags(down, kCGEventFlagMaskCommand)
         CGEventPost(kCGHIDEventTap, down)
-        _pump(PASTE_KEY_DOWN_DELAY)
+        self._pump_runloop_for(PASTE_KEY_DOWN_DELAY)
         up = CGEventCreateKeyboardEvent(src, 0x09, False)
         CGEventSetFlags(up, kCGEventFlagMaskCommand)
         CGEventPost(kCGHIDEventTap, up)
 
         # Optionally press Enter
         if self.after_action == "enter" and not self._skip_enter:
-            _pump(PASTE_PRE_ENTER_DELAY)
+            self._pump_runloop_for(PASTE_PRE_ENTER_DELAY)
             down = CGEventCreateKeyboardEvent(src, 0x24, True)
             CGEventPost(kCGHIDEventTap, down)
-            _pump(ENTER_KEY_DOWN_DELAY)
+            self._pump_runloop_for(ENTER_KEY_DOWN_DELAY)
             up = CGEventCreateKeyboardEvent(src, 0x24, False)
             CGEventPost(kCGHIDEventTap, up)
 
-        # Wait for paste to be consumed
-        _pump(PASTE_SETTLE_DELAY)
+        self._pump_runloop_for(PASTE_SETTLE_DELAY)
 
-        # Switch back (only if we switched away from the original app/window)
+    def _switch_back_and_replay(self, workspace, return_to_app, return_to_app_ref,
+                                 return_to_window_ref, needs_switch, needs_window_raise):
+        """Return to the original window and replay buffered keystrokes.
+
+        Security: activates the original window and posts all captured
+        keystroke events back into the system event stream.
+        """
         if (needs_switch or needs_window_raise) and return_to_app:
             if needs_switch:
                 return_to_app.activateWithOptions_(0)
@@ -780,21 +842,77 @@ class SpeechToType:
                 ax_raise_window(return_to_window_ref)
                 if return_to_app_ref:
                     ax_set_focused_window(return_to_app_ref, return_to_window_ref)
-            _pump(SWITCH_BACK_DELAY)
+            self._pump_runloop_for(SWITCH_BACK_DELAY)
 
-        # Stop capturing and replay buffered keystrokes
         self._paste_capturing = False
-        _pump(PRE_REPLAY_DELAY)
+        self._pump_runloop_for(PRE_REPLAY_DELAY)
         for evt in self._captured_events:
             CGEventPost(kCGHIDEventTap, evt)
             time.sleep(KEYSTROKE_REPLAY_INTERVAL)
         self._captured_events.clear()
 
-        # Restore original clipboard after everything has settled
+    def _restore_clipboard(self, pb, old_clipboard):
+        """Restore the original clipboard contents (best-effort).
+
+        Security: writes the system clipboard.
+        """
         if old_clipboard is not None:
-            _pump(CLIPBOARD_RESTORE_DELAY)
+            self._pump_runloop_for(CLIPBOARD_RESTORE_DELAY)
             pb.clearContents()
             pb.setString_forType_(old_clipboard, NSPasteboardTypeString)
+
+    def _pump_runloop_for(self, seconds):
+        """Pump CFRunLoop for *seconds*, processing event tap callbacks.
+
+        Security: processes pending CGEvent tap callbacks during the wait.
+        Uses short iterations so synthetic events are delivered promptly.
+        """
+        _rl = CoreFoundation.kCFRunLoopDefaultMode
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            CFRunLoopRunInMode(_rl, PUMP_INTERVAL, False)
+            remaining = deadline - time.monotonic()
+            if remaining > PUMP_SLEEP:
+                time.sleep(PUMP_SLEEP)
+
+    def _type_text_into_target(self, text):
+        """Orchestrate the full paste workflow.
+
+        Security: touches clipboard, posts synthetic key events, activates
+        cross-process windows, and temporarily captures all keystrokes.
+        Wrapped in try/finally to guarantee cleanup on any failure.
+        """
+        targets = self._resolve_paste_targets()
+        if targets is None:
+            return
+        (workspace, return_to_app, return_to_app_ref,
+         return_to_window_ref, target_app, target_window_ref) = targets
+
+        pb, old_clipboard = self._save_and_set_clipboard(text)
+
+        # Create a private event source and start keystroke capture
+        src = CGEventSourceCreate(kCGEventSourceStatePrivate)
+        self._paste_source_state_id = CGEventSourceGetSourceStateID(src)
+        self._captured_events.clear()
+        self._paste_capturing = True
+
+        try:
+            needs_switch, needs_window_raise = self._switch_to_target_window(
+                workspace, target_app, target_window_ref, return_to_window_ref)
+
+            self._paste_and_enter(src)
+
+            self._switch_back_and_replay(
+                workspace, return_to_app, return_to_app_ref,
+                return_to_window_ref, needs_switch, needs_window_raise)
+        finally:
+            # Guarantee cleanup even if an exception occurs mid-workflow
+            self._paste_capturing = False
+            self._captured_events.clear()
+            try:
+                self._restore_clipboard(pb, old_clipboard)
+            except Exception:
+                pass  # best-effort clipboard restore
 
     # ── Descriptions ────────────────────────────────────────
 
