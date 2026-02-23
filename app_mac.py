@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 vibe-code-mic Desktop App (macOS)
-Interactive console UI with configurable hotkey, mode, and audio device.
+Native AppKit GUI with configurable hotkey, mode, and audio device.
 Hold (or toggle) a key to record speech, transcribes and types it out.
 
 Security model
@@ -38,22 +38,37 @@ Sections that touch privileged macOS APIs are marked with
 
 import sys
 import os
+
 import argparse
 import json5
 import time
 import threading
 import subprocess
-import curses
 import numpy as np
 import sounddevice as sd
 import mlx_whisper
 
+import objc
 import AppKit
-from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+from AppKit import (
+    NSApplication, NSApplicationActivationPolicyRegular, NSApplicationActivationPolicyAccessory,
+    NSWindow, NSBackingStoreBuffered,
+    NSTextField, NSPopUpButton, NSButton,
+    NSScrollView, NSTextView, NSBezelStyleRounded,
+    NSFont, NSColor,
+    NSPasteboardTypeString, NSStatusBar, NSVariableStatusItemLength,
+    NSTimer,
+    NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
+    NSWindowStyleMaskMiniaturizable, NSWindowStyleMaskResizable,
+)
 import Quartz
 
-# Prevent the app from showing a bouncing icon in the Dock
-NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+if getattr(sys, 'frozen', False):
+    # .app bundle: show Dock icon and proper window
+    NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyRegular)
+else:
+    # Running from terminal: stay accessory so Terminal's Accessibility permission covers us
+    NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 from Quartz import (
     CGEventCreateKeyboardEvent,
     CGEventPost,
@@ -75,10 +90,59 @@ from Quartz import (
     kCGEventFlagMaskCommand,
     kCGEventSourceStatePrivate,
 )
-from Foundation import NSRunLoop, NSDate, CFRunLoopGetCurrent, CFRunLoopRunInMode
+from Foundation import NSRunLoop, NSDate, CFRunLoopGetCurrent, CFRunLoopRunInMode, NSMakeRect, NSObject
 from AppKit import NSPasteboardTypeString, NSStatusBar, NSVariableStatusItemLength, NSFont
 import CoreFoundation
 import ApplicationServices
+import ctypes
+import ctypes.util
+
+# ── Accessibility trust check ────────────────────────────────────
+# Use CoreFoundation via ctypes for AXIsProcessTrustedWithOptions
+# which can prompt the user to grant Accessibility permission.
+
+_security_lib = ctypes.cdll.LoadLibrary(ctypes.util.find_library("ApplicationServices"))
+_cf_lib = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreFoundation"))
+
+_security_lib.AXIsProcessTrusted.restype = ctypes.c_bool
+_security_lib.AXIsProcessTrustedWithOptions.argtypes = [ctypes.c_void_p]
+_security_lib.AXIsProcessTrustedWithOptions.restype = ctypes.c_bool
+
+_cf_lib.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+_cf_lib.CFStringCreateWithCString.restype = ctypes.c_void_p
+_cf_lib.CFDictionaryCreate.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+    ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p,
+]
+_cf_lib.CFDictionaryCreate.restype = ctypes.c_void_p
+_cf_lib.CFRelease.argtypes = [ctypes.c_void_p]
+_cf_lib.kCFBooleanTrue = ctypes.c_void_p.in_dll(_cf_lib, "kCFBooleanTrue")
+_cf_lib.kCFTypeDictionaryKeyCallBacks = ctypes.c_void_p.in_dll(_cf_lib, "kCFTypeDictionaryKeyCallBacks")
+_cf_lib.kCFTypeDictionaryValueCallBacks = ctypes.c_void_p.in_dll(_cf_lib, "kCFTypeDictionaryValueCallBacks")
+
+
+def _is_accessibility_trusted(prompt=False):
+    """Check if the process has Accessibility permission.
+
+    If *prompt* is True, macOS will show the system dialog asking the
+    user to grant permission (only works for .app bundles).
+    """
+    if not prompt:
+        return _security_lib.AXIsProcessTrusted()
+    key = _cf_lib.CFStringCreateWithCString(
+        None, b"AXTrustedCheckOptionPrompt", 0x08000100  # kCFStringEncodingUTF8
+    )
+    keys = (ctypes.c_void_p * 1)(key)
+    values = (ctypes.c_void_p * 1)(_cf_lib.kCFBooleanTrue)
+    opts = _cf_lib.CFDictionaryCreate(
+        None, keys, values, 1,
+        ctypes.addressof(_cf_lib.kCFTypeDictionaryKeyCallBacks),
+        ctypes.addressof(_cf_lib.kCFTypeDictionaryValueCallBacks),
+    )
+    result = _security_lib.AXIsProcessTrustedWithOptions(opts)
+    _cf_lib.CFRelease(opts)
+    _cf_lib.CFRelease(key)
+    return result
 
 # ── macOS key code mapping ──────────────────────────────────────────
 
@@ -90,8 +154,7 @@ KEYCODE_MAP = {
     "9": 0x19, "7": 0x1A, "-": 0x1B, "8": 0x1C, "0": 0x1D, "]": 0x1E,
     "o": 0x1F, "u": 0x20, "[": 0x21, "i": 0x22, "p": 0x23, "l": 0x25,
     "j": 0x26, "'": 0x27, "k": 0x28, ";": 0x29, "\\": 0x2A, ",": 0x2B,
-    "/": 0x2C, "n": 0x2D, "m": 0x2E, ".": 0x2F, "`": 0x32, "§": 0x0A,
-    "\u00a7": 0x0A,
+    "/": 0x2C, "n": 0x2D, "m": 0x2E, ".": 0x2F, "`": 0x32, "\u00a7": 0x0A,
     "return": 0x24, "enter": 0x24, "tab": 0x30, "space": 0x31,
     "delete": 0x33, "backspace": 0x33, "escape": 0x35, "esc": 0x35,
     "f1": 0x7A, "f2": 0x78, "f3": 0x63, "f4": 0x76, "f5": 0x60,
@@ -127,17 +190,33 @@ SAMPLE_RATE = 16000
 
 
 def _get_app_dir():
-    """Return the directory containing the executable (frozen) or script."""
+    """Return the directory containing the executable (frozen) or script.
+
+    In a .app bundle, sys.executable is deep inside at
+    vibe-code-mic.app/Contents/MacOS/vibe-code-mic.  Settings and logs
+    should live next to the .app bundle, not inside it.
+    """
     if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
+        exe_dir = os.path.dirname(sys.executable)
+        # Detect .app bundle: …/Foo.app/Contents/MacOS
+        if (os.path.basename(exe_dir) == 'MacOS'
+                and os.path.basename(os.path.dirname(exe_dir)) == 'Contents'
+                and os.path.dirname(os.path.dirname(exe_dir)).endswith('.app')):
+            # Return the directory that *contains* the .app bundle
+            return os.path.dirname(os.path.dirname(os.path.dirname(exe_dir)))
+        return exe_dir
     return os.path.dirname(os.path.abspath(__file__))
 
 
 DEFAULT_SETTINGS_PATH = os.path.join(_get_app_dir(), "settings.json5")
 LOG_PATH = os.path.join(_get_app_dir(), "vibe-code-mic.log")
 
-# Open a persistent log file for redirecting library output away from curses
+# Open a persistent log file for library output
 _log_file = open(LOG_PATH, "a")
+
+# Redirect stdout/stderr to log file so library noise doesn't go nowhere
+sys.stdout = _log_file
+sys.stderr = _log_file
 
 # ── Timing & threshold constants ─────────────────────────────────
 MAX_RECORDING_DURATION = 30.0        # seconds - auto-stop recording
@@ -170,9 +249,8 @@ REBIND_POLL_INTERVAL = 0.1           # seconds between checks
 REBIND_TIMEOUT_POLLS = 100           # max iterations (10s total)
 
 # UI
-CURSES_INPUT_TIMEOUT_MS = 100        # getch timeout
-MAIN_LOOP_PUMP_DURATION = 0.01       # CFRunLoop pump in main loop
 QUIT_DELAY = 0.3                     # pause before quitting
+GUI_TIMER_INTERVAL = 0.1             # NSTimer interval for UI refresh
 
 
 def get_input_devices():
@@ -273,7 +351,6 @@ class SpeechToType:
         self._target_app = None
         self._target_app_ref = None
         self._target_window_ref = None
-
 
         # CGEvent tap for global hotkeys
         self._tap_port = None
@@ -507,6 +584,14 @@ class SpeechToType:
         """
         self._uninstall_hotkey_tap()
 
+        # Check accessibility permission explicitly and prompt if missing
+        if not _is_accessibility_trusted(prompt=False):
+            # Trigger the system prompt to grant accessibility
+            _is_accessibility_trusted(prompt=True)
+            self.status = "Grant Accessibility permission in System Settings, then restart"
+            self._needs_redraw = True
+            return
+
         tap_mask = (1 << kCGEventKeyDown) | (1 << kCGEventKeyUp) | (1 << kCGEventFlagsChanged)
         self._tap_port = CGEventTapCreate(
             kCGHIDEventTap,
@@ -517,7 +602,7 @@ class SpeechToType:
             None,
         )
         if not self._tap_port:
-            self.status = "WARNING: no event tap (grant Accessibility to terminal)"
+            self.status = "WARNING: no event tap (Accessibility granted but tap failed — try restarting)"
             self._needs_redraw = True
             return
 
@@ -543,7 +628,6 @@ class SpeechToType:
 
     def _pump_runloop(self, seconds=0.01):
         """Pump the main CFRunLoop so CGEvent tap callbacks fire."""
-        # This must run on the main thread (where curses loop runs)
         CFRunLoopRunInMode(CoreFoundation.kCFRunLoopDefaultMode, seconds, False)
 
     # ── Menu bar timer ─────────────────────────────────────
@@ -941,13 +1025,13 @@ class SpeechToType:
             return f"vibe-code-mic v{VERSION} (macOS). Local speech recognition powered by Whisper via MLX (Apple Silicon GPU). All processing happens on your machine — no data is sent to the cloud."
         elif selected == 1:
             if self.input_devices:
-                return "Input device for recording. Use Left/Right to cycle through available microphones and audio inputs on your system."
+                return "Input device for recording. Choose from available microphones and audio inputs on your system."
             return "No input devices found."
         elif selected == 2:
             model_name = MODELS[self.model_idx]
             return self.MODEL_INFO.get(model_name, "")
         elif selected == 3:
-            return "Global hotkey to start/stop recording. Press Enter to rebind, then press any key to set it as the new hotkey."
+            return "Global hotkey to start/stop recording. Click to rebind, then press any key to set it as the new hotkey."
         elif selected == 4:
             return "A single tap during recording cancels it. Audio is discarded and nothing is typed. In toggle mode, press this before pressing the record key again."
         elif selected == 5:
@@ -976,179 +1060,7 @@ class SpeechToType:
                 return "System audio stays on during recording. Enable this if your microphone picks up sounds from your speakers."
         return ""
 
-    # ── Curses TUI ──────────────────────────────────────────
-
-    def draw_ui(self, stdscr, selected, rebinding):
-        stdscr.erase()
-        h, w = stdscr.getmaxyx()
-
-        def safe_addstr(y, x, text, attr=0):
-            if y < h and x < w:
-                stdscr.addnstr(y, x, text, w - x - 1, attr)
-
-        def wrap_text(text, avail):
-            if avail <= 0:
-                return []
-            result = []
-            for paragraph in text.split('\n'):
-                words = paragraph.split(' ')
-                cur = ''
-                for word in words:
-                    if not cur:
-                        cur = word
-                    elif len(cur) + 1 + len(word) <= avail:
-                        cur += ' ' + word
-                    else:
-                        result.append(cur)
-                        cur = word
-                    while len(cur) > avail:
-                        result.append(cur[:avail])
-                        cur = cur[avail:]
-                if cur or not paragraph:
-                    result.append(cur)
-            return result if result else ['']
-
-        def draw_wrapped(y, x, text, attr=0):
-            avail = w - x - 1
-            lines = wrap_text(text, avail)
-            for i, line in enumerate(lines):
-                if (y + i) < h:
-                    safe_addstr(y + i, x, line, attr)
-            return max(len(lines), 1)
-
-        safe_addstr(0, 0, "=== vibe-code-mic (macOS) ===", curses.A_BOLD)
-
-        # About
-        prefix = "> " if selected == 0 else "  "
-        safe_addstr(2, 0, f"{prefix}About:         ", curses.A_BOLD if selected == 0 else 0)
-        safe_addstr(2, 17, f" v{VERSION} ", curses.color_pair(4))
-
-        # Device
-        dev_name = self.input_devices[self.device_idx][1] if self.input_devices else "(none)"
-        prefix = "> " if selected == 1 else "  "
-        attr = curses.A_REVERSE if selected == 1 else 0
-        safe_addstr(3, 0, f"{prefix}Audio Device:  ", curses.A_BOLD if selected == 1 else 0)
-        safe_addstr(3, 17, f" < {dev_name} > ", attr)
-
-        # Model
-        prefix = "> " if selected == 2 else "  "
-        attr = curses.A_REVERSE if selected == 2 else 0
-        model_name = MODELS[self.model_idx]
-        safe_addstr(4, 0, f"{prefix}Model:         ", curses.A_BOLD if selected == 2 else 0)
-        model_hint = "(current)" if self.model_idx == self.loaded_model_idx else "(Enter to reload)"
-        safe_addstr(4, 17, f" < {model_name} > {model_hint} ", attr)
-
-        # Hotkey
-        prefix = "> " if selected == 3 else "  "
-        attr = curses.A_REVERSE if selected == 3 else 0
-        safe_addstr(5, 0, f"{prefix}Record Key:    ", curses.A_BOLD if selected == 3 else 0)
-        if rebinding == "hotkey":
-            safe_addstr(5, 17, " [press a key / Esc to disable] ", curses.A_BLINK | curses.A_REVERSE)
-        elif self.hotkey:
-            safe_addstr(5, 17, f" {self.hotkey.upper()} (Enter to change) ", attr)
-        else:
-            safe_addstr(5, 17, " Disabled (Enter to set) ", attr)
-
-        # Cancel Key
-        prefix = "> " if selected == 4 else "  "
-        attr = curses.A_REVERSE if selected == 4 else 0
-        safe_addstr(6, 0, f"{prefix}Cancel Key:    ", curses.A_BOLD if selected == 4 else 0)
-        if rebinding == "cancel":
-            safe_addstr(6, 17, " [press a key / Esc to disable] ", curses.A_BLINK | curses.A_REVERSE)
-        elif self.cancel_key:
-            safe_addstr(6, 17, f" {self.cancel_key.upper()} (Enter to change) ", attr)
-        else:
-            safe_addstr(6, 17, " Disabled (Enter to set) ", attr)
-
-        # Cancel But Type Key
-        prefix = "> " if selected == 5 else "  "
-        attr = curses.A_REVERSE if selected == 5 else 0
-        safe_addstr(7, 0, f"{prefix}Cancel+Type Key:", curses.A_BOLD if selected == 5 else 0)
-        if rebinding == "no_enter":
-            safe_addstr(7, 18, " [press a key / Esc to disable] ", curses.A_BLINK | curses.A_REVERSE)
-        elif self.no_enter_key:
-            safe_addstr(7, 18, f" {self.no_enter_key.upper()} (Enter to change) ", attr)
-        else:
-            safe_addstr(7, 18, " Disabled (Enter to set) ", attr)
-
-        # Mode
-        prefix = "> " if selected == 6 else "  "
-        attr = curses.A_REVERSE if selected == 6 else 0
-        mode_label = "Push to hold" if self.mode == "push" else "Toggle"
-        safe_addstr(8, 0, f"{prefix}Mode:          ", curses.A_BOLD if selected == 6 else 0)
-        safe_addstr(8, 17, f" < {mode_label} > ", attr)
-
-        # After action
-        prefix = "> " if selected == 7 else "  "
-        attr = curses.A_REVERSE if selected == 7 else 0
-        after_label = "Press Enter" if self.after_action == "enter" else "Do nothing"
-        safe_addstr(9, 0, f"{prefix}After Record:  ", curses.A_BOLD if selected == 7 else 0)
-        safe_addstr(9, 17, f" < {after_label} > ", attr)
-
-        # Window target
-        prefix = "> " if selected == 8 else "  "
-        attr = curses.A_REVERSE if selected == 8 else 0
-        target_label = "Original window" if self.window_target == "original" else "Active window"
-        safe_addstr(10, 0, f"{prefix}Type Target:   ", curses.A_BOLD if selected == 8 else 0)
-        safe_addstr(10, 17, f" < {target_label} > ", attr)
-
-        # Deafen while recording
-        prefix = "> " if selected == 9 else "  "
-        attr = curses.A_REVERSE if selected == 9 else 0
-        deafen_labels = {"off": "Off", "half": "50%", "on": "On"}
-        deafen_label = deafen_labels.get(self.deafen_while_recording, "Off")
-        safe_addstr(11, 0, f"{prefix}Deafen on Rec: ", curses.A_BOLD if selected == 9 else 0)
-        safe_addstr(11, 17, f" < {deafen_label} > ", attr)
-
-        # Description for selected option
-        desc = self._get_description(selected)
-        desc_lines = draw_wrapped(13, 2, desc, curses.color_pair(4))
-
-        # Bottom-pinned: help at very bottom, status above
-        help_y = h - 1
-        safe_addstr(help_y, 0, "  Up/Down: navigate | Left/Right: change | Ctrl+C: quit")
-
-        # Status with color
-        display_status = self.status
-        if self._recording and self._record_start_time is not None:
-            elapsed = time.perf_counter() - self._record_start_time
-            display_status = f"Recording... {elapsed:.1f}s / {MAX_RECORDING_DURATION:.0f}s"
-
-        if "Recording" in display_status:
-            status_color = curses.color_pair(2) | curses.A_BOLD
-        elif "Transcribing" in display_status:
-            status_color = curses.color_pair(3) | curses.A_BOLD
-        elif "Quitting" in display_status:
-            status_color = curses.color_pair(3) | curses.A_BOLD
-        elif "Ready" in display_status:
-            status_color = curses.color_pair(1)
-        else:
-            status_color = curses.color_pair(4)
-        model_label = MODELS[self.loaded_model_idx] if self.loaded_model_idx is not None else "none"
-        status_text = f"{display_status}  [model: {model_label}]"
-        status_avail = w - 10 - 1
-        status_lines = wrap_text(status_text, status_avail)
-        status_line_count = max(len(status_lines), 1)
-        status_y = help_y - 1 - status_line_count
-        safe_addstr(status_y, 0, "  Status: ")
-        for i, sline in enumerate(status_lines):
-            if (status_y + i) < h:
-                safe_addstr(status_y + i, 10, sline, status_color)
-
-        # Last transcription
-        if self.last_text:
-            last_start_y = 13 + desc_lines + 1
-            last_end_y = status_y - 1
-            avail_lines = last_end_y - last_start_y
-            avail_width = w - 12
-            if avail_lines > 0 and avail_width > 0:
-                safe_addstr(last_start_y, 0, "  Last:   ", curses.color_pair(4))
-                text_with_time = f'"{self.last_text}" ({self.last_time:.1f}s)'
-                wrapped = wrap_text(text_with_time, avail_width)
-                for line, chunk in enumerate(wrapped[:avail_lines]):
-                    safe_addstr(last_start_y + line, 10, chunk, curses.A_BOLD)
-
-        stdscr.refresh()
+    # ── Key rebinding ──────────────────────────────────────
 
     def _rebind_key_via_tap(self, attr="hotkey"):
         """Wait for a single keypress via CGEvent tap and rebind the specified key."""
@@ -1215,120 +1127,6 @@ class SpeechToType:
         self._needs_redraw = True
         self._install_hotkey_tap()
 
-    def run_curses(self, stdscr):
-        # Redirect all stdout/stderr to log file while curses is active
-        sys.stdout, sys.stderr = _log_file, _log_file
-
-        # Clear screen to fix alignment issues in frozen bundles
-        stdscr.clear()
-        stdscr.refresh()
-
-        curses.curs_set(0)
-        stdscr.nodelay(True)
-        stdscr.timeout(CURSES_INPUT_TIMEOUT_MS)
-        curses.start_color()
-        curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_GREEN, -1)   # ready
-        curses.init_pair(2, curses.COLOR_RED, -1)      # recording
-        curses.init_pair(3, curses.COLOR_YELLOW, -1)   # transcribing
-        curses.init_pair(4, curses.COLOR_CYAN, -1)     # info
-
-        NUM_SETTINGS = 10
-        selected = 0
-        rebinding = False
-
-        # Load model and install hotkey tap in background
-        threading.Thread(target=self._load_and_hook, daemon=True).start()
-
-        try:
-            while self._running:
-                # Pump the CFRunLoop so CGEvent tap callbacks fire
-                self._pump_runloop(MAIN_LOOP_PUMP_DURATION)
-
-                self._tick_menu_bar()
-                self.draw_ui(stdscr, selected, rebinding)
-                self._needs_redraw = False
-
-                try:
-                    key = stdscr.getch()
-                except KeyboardInterrupt:
-                    self.status = "Quitting..."
-                    self.draw_ui(stdscr, selected, rebinding)
-                    stdscr.refresh()
-                    time.sleep(QUIT_DELAY)
-                    break
-                except Exception:
-                    key = -1
-
-                if key == -1:
-                    continue
-
-                if key == 3:  # Ctrl+C
-                    break
-
-                if rebinding:
-                    rebinding = False
-                    self._needs_redraw = True
-                    continue
-
-                if key == curses.KEY_UP:
-                    selected = (selected - 1) % NUM_SETTINGS
-                elif key == curses.KEY_DOWN:
-                    selected = (selected + 1) % NUM_SETTINGS
-                elif key == curses.KEY_LEFT or key == curses.KEY_RIGHT:
-                    if selected == 1 and self.input_devices:
-                        if key == curses.KEY_LEFT:
-                            self.device_idx = (self.device_idx - 1) % len(self.input_devices)
-                        else:
-                            self.device_idx = (self.device_idx + 1) % len(self.input_devices)
-                    elif selected == 2:
-                        if key == curses.KEY_LEFT:
-                            self.model_idx = (self.model_idx - 1) % len(MODELS)
-                        else:
-                            self.model_idx = (self.model_idx + 1) % len(MODELS)
-                    elif selected == 6:
-                        self.mode = "toggle" if self.mode == "push" else "push"
-                    elif selected == 7:
-                        self.after_action = "nothing" if self.after_action == "enter" else "enter"
-                    elif selected == 8:
-                        self.window_target = "active" if self.window_target == "original" else "original"
-                    elif selected == 9:
-                        deafen_options = ["off", "half", "on"]
-                        cur = deafen_options.index(self.deafen_while_recording) if self.deafen_while_recording in deafen_options else 0
-                        if key == curses.KEY_LEFT:
-                            cur = (cur - 1) % len(deafen_options)
-                        else:
-                            cur = (cur + 1) % len(deafen_options)
-                        self.deafen_while_recording = deafen_options[cur]
-                    self._save_settings()
-                elif key == 10 or key == curses.KEY_ENTER:
-                    if selected == 2:
-                        self._uninstall_hotkey_tap()
-                        self._save_settings()
-                        threading.Thread(target=self._load_and_hook, daemon=True).start()
-                    elif selected == 3:
-                        rebinding = "hotkey"
-                        self._uninstall_hotkey_tap()
-                        self.status = "Press the new record key..."
-                        self._needs_redraw = True
-                        threading.Thread(target=lambda: self._rebind_key_via_tap("hotkey"), daemon=True).start()
-                    elif selected == 4:
-                        rebinding = "cancel"
-                        self._uninstall_hotkey_tap()
-                        self.status = "Press the new cancel key..."
-                        self._needs_redraw = True
-                        threading.Thread(target=lambda: self._rebind_key_via_tap("cancel_key"), daemon=True).start()
-                    elif selected == 5:
-                        rebinding = "no_enter"
-                        self._uninstall_hotkey_tap()
-                        self.status = "Press the new cancel+type key..."
-                        self._needs_redraw = True
-                        threading.Thread(target=lambda: self._rebind_key_via_tap("no_enter_key"), daemon=True).start()
-        finally:
-            _log_file.flush()
-            sys.stdout = sys.__stdout__
-            sys.stderr = sys.__stderr__
-
     def _load_and_hook(self):
         self.load_model()
         self._install_hotkey_tap()
@@ -1342,8 +1140,324 @@ class SpeechToType:
         NSStatusBar.systemStatusBar().removeStatusItem_(self._status_item)
 
     def run(self):
-        curses.wrapper(self.run_curses)
-        self.quit_app()
+        app = NSApplication.sharedApplication()
+        delegate = AppDelegate.alloc().init()
+        delegate.stt = self
+        app.setDelegate_(delegate)
+        app.run()
+
+
+# ── AppKit GUI ─────────────────────────────────────────────────────
+
+class AppDelegate(NSObject):
+    stt = objc.ivar()
+
+    def applicationDidFinishLaunching_(self, notification):
+        self._rebinding = None
+        self._build_window()
+        self._refresh_controls()
+        self._update_description(0)
+
+        # Periodic timer for UI refresh
+        self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            GUI_TIMER_INTERVAL, self, b"tick:", None, True
+        )
+
+        # Load model and install hotkey tap in background
+        threading.Thread(target=self.stt._load_and_hook, daemon=True).start()
+
+    def _build_window(self):
+        W, H = 480, 580
+        style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                 | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
+        self._window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(200, 200, W, H), style, NSBackingStoreBuffered, False
+        )
+        self._window.setTitle_("vibe-code-mic")
+        self._window.setMinSize_((W, H))
+        self._window.setDelegate_(self)
+
+        cv = self._window.contentView()
+        cv.setFlipped_(True)
+
+        y = 12
+        ROW_H = 30
+        LABEL_X = 12
+        CTRL_X = 160
+        CTRL_W = 290
+
+        def make_label(text, ypos):
+            lbl = NSTextField.labelWithString_(text)
+            lbl.setFrame_(NSMakeRect(LABEL_X, ypos + 4, 140, 20))
+            lbl.setFont_(NSFont.systemFontOfSize_(13))
+            cv.addSubview_(lbl)
+            return lbl
+
+        def make_popup(items, ypos, action):
+            popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+                NSMakeRect(CTRL_X, ypos, CTRL_W, 26), False
+            )
+            popup.addItemsWithTitles_(items)
+            popup.setTarget_(self)
+            popup.setAction_(action)
+            cv.addSubview_(popup)
+            return popup
+
+        def make_button(title, ypos, action):
+            btn = NSButton.alloc().initWithFrame_(NSMakeRect(CTRL_X, ypos, CTRL_W, 26))
+            btn.setTitle_(title)
+            btn.setBezelStyle_(NSBezelStyleRounded)
+            btn.setTarget_(self)
+            btn.setAction_(action)
+            cv.addSubview_(btn)
+            return btn
+
+        # Row 0: About
+        make_label("About", y)
+        self._about_label = NSTextField.labelWithString_(f"v{VERSION}")
+        self._about_label.setFrame_(NSMakeRect(CTRL_X, y + 4, CTRL_W, 20))
+        self._about_label.setFont_(NSFont.systemFontOfSize_(12))
+        self._about_label.setTextColor_(NSColor.secondaryLabelColor())
+        cv.addSubview_(self._about_label)
+        y += ROW_H
+
+        # Row 1: Audio Device
+        make_label("Audio Device", y)
+        dev_names = [name for _, name in self.stt.input_devices] if self.stt.input_devices else ["(none)"]
+        self._device_popup = make_popup(dev_names, y, b"deviceChanged:")
+        y += ROW_H
+
+        # Row 2: Model + Reload
+        make_label("Model", y)
+        self._model_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(CTRL_X, y, CTRL_W - 80, 26), False
+        )
+        self._model_popup.addItemsWithTitles_(MODELS)
+        self._model_popup.setTarget_(self)
+        self._model_popup.setAction_(b"modelChanged:")
+        cv.addSubview_(self._model_popup)
+        self._reload_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(CTRL_X + CTRL_W - 74, y, 74, 26)
+        )
+        self._reload_btn.setTitle_("Reload")
+        self._reload_btn.setBezelStyle_(NSBezelStyleRounded)
+        self._reload_btn.setTarget_(self)
+        self._reload_btn.setAction_(b"reloadModel:")
+        cv.addSubview_(self._reload_btn)
+        y += ROW_H
+
+        # Row 3: Record Key
+        make_label("Record Key", y)
+        self._hotkey_btn = make_button("", y, b"rebindHotkey:")
+        y += ROW_H
+
+        # Row 4: Cancel Key
+        make_label("Cancel Key", y)
+        self._cancel_btn = make_button("", y, b"rebindCancel:")
+        y += ROW_H
+
+        # Row 5: Cancel+Type Key
+        make_label("Cancel+Type Key", y)
+        self._noenter_btn = make_button("", y, b"rebindNoEnter:")
+        y += ROW_H
+
+        # Row 6: Mode
+        make_label("Mode", y)
+        self._mode_popup = make_popup(["Push to hold", "Toggle"], y, b"modeChanged:")
+        y += ROW_H
+
+        # Row 7: After Record
+        make_label("After Record", y)
+        self._after_popup = make_popup(["Press Enter", "Do nothing"], y, b"afterChanged:")
+        y += ROW_H
+
+        # Row 8: Type Target
+        make_label("Type Target", y)
+        self._target_popup = make_popup(["Original window", "Active window"], y, b"targetChanged:")
+        y += ROW_H
+
+        # Row 9: Deafen on Rec
+        make_label("Deafen on Rec", y)
+        self._deafen_popup = make_popup(["Off", "50%", "On"], y, b"deafenChanged:")
+        y += ROW_H + 8
+
+        # Description label
+        self._desc_label = NSTextField.wrappingLabelWithString_("")
+        self._desc_label.setFrame_(NSMakeRect(LABEL_X, y, W - 24, 60))
+        self._desc_label.setFont_(NSFont.systemFontOfSize_(11))
+        self._desc_label.setTextColor_(NSColor.secondaryLabelColor())
+        cv.addSubview_(self._desc_label)
+        y += 64
+
+        # Status label
+        self._status_label = NSTextField.labelWithString_("Loading model...")
+        self._status_label.setFrame_(NSMakeRect(LABEL_X, y, W - 24, 20))
+        self._status_label.setFont_(NSFont.boldSystemFontOfSize_(13))
+        cv.addSubview_(self._status_label)
+        y += 26
+
+        # Scrollable text view for last transcription
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(LABEL_X, y, W - 24, 90))
+        scroll.setHasVerticalScroller_(True)
+        scroll.setBorderType_(1)  # NSBezelBorder
+        self._text_view = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, W - 40, 90))
+        self._text_view.setEditable_(False)
+        self._text_view.setFont_(NSFont.systemFontOfSize_(12))
+        scroll.setDocumentView_(self._text_view)
+        cv.addSubview_(scroll)
+
+        self._window.makeKeyAndOrderFront_(None)
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+
+    def _refresh_controls(self):
+        stt = self.stt
+        if stt.input_devices:
+            self._device_popup.selectItemAtIndex_(stt.device_idx)
+        self._model_popup.selectItemAtIndex_(stt.model_idx)
+        self._hotkey_btn.setTitle_(stt.hotkey.upper() if stt.hotkey else "Disabled")
+        self._cancel_btn.setTitle_(stt.cancel_key.upper() if stt.cancel_key else "Disabled")
+        self._noenter_btn.setTitle_(stt.no_enter_key.upper() if stt.no_enter_key else "Disabled")
+        self._mode_popup.selectItemAtIndex_(0 if stt.mode == "push" else 1)
+        self._after_popup.selectItemAtIndex_(0 if stt.after_action == "enter" else 1)
+        self._target_popup.selectItemAtIndex_(0 if stt.window_target == "original" else 1)
+        deafen_map = {"off": 0, "half": 1, "on": 2}
+        self._deafen_popup.selectItemAtIndex_(deafen_map.get(stt.deafen_while_recording, 0))
+
+    def _update_description(self, row):
+        desc = self.stt._get_description(row)
+        self._desc_label.setStringValue_(desc)
+
+    def _update_status_display(self):
+        stt = self.stt
+        display_status = stt.status
+        if stt._recording and stt._record_start_time is not None:
+            elapsed = time.perf_counter() - stt._record_start_time
+            display_status = f"Recording... {elapsed:.1f}s / {MAX_RECORDING_DURATION:.0f}s"
+
+        model_label = MODELS[stt.loaded_model_idx] if stt.loaded_model_idx is not None else "none"
+        self._status_label.setStringValue_(f"{display_status}  [model: {model_label}]")
+
+        if "Recording" in display_status:
+            self._status_label.setTextColor_(NSColor.systemRedColor())
+        elif "Transcribing" in display_status:
+            self._status_label.setTextColor_(NSColor.systemOrangeColor())
+        elif "Ready" in display_status:
+            self._status_label.setTextColor_(NSColor.systemGreenColor())
+        else:
+            self._status_label.setTextColor_(NSColor.labelColor())
+
+        if stt.last_text:
+            self._text_view.setString_(f'"{stt.last_text}" ({stt.last_time:.1f}s)')
+
+    # ── Timer tick ──────────────────────────────────────────
+
+    @objc.typedSelector(b"v@:@")
+    def tick_(self, timer):
+        stt = self.stt
+        stt._tick_menu_bar()
+
+        # Retry accessibility tap if needed (only if accessibility is now granted)
+        if stt._tap_port is None and self._rebinding is None:
+            if _is_accessibility_trusted(prompt=False):
+                stt._install_hotkey_tap()
+
+        if stt._needs_redraw or stt._recording:
+            stt._needs_redraw = False
+            self._update_status_display()
+            if not stt._recording:
+                self._refresh_controls()
+
+    # ── Control actions ─────────────────────────────────────
+
+    @objc.typedSelector(b"v@:@")
+    def deviceChanged_(self, sender):
+        idx = sender.indexOfSelectedItem()
+        if self.stt.input_devices and 0 <= idx < len(self.stt.input_devices):
+            self.stt.device_idx = idx
+            self.stt._save_settings()
+        self._update_description(1)
+
+    @objc.typedSelector(b"v@:@")
+    def modelChanged_(self, sender):
+        self.stt.model_idx = sender.indexOfSelectedItem()
+        self.stt._save_settings()
+        self._update_description(2)
+
+    @objc.typedSelector(b"v@:@")
+    def reloadModel_(self, sender):
+        self.stt._uninstall_hotkey_tap()
+        self.stt._save_settings()
+        threading.Thread(target=self.stt._load_and_hook, daemon=True).start()
+
+    @objc.typedSelector(b"v@:@")
+    def modeChanged_(self, sender):
+        self.stt.mode = "push" if sender.indexOfSelectedItem() == 0 else "toggle"
+        self.stt._save_settings()
+        self._update_description(6)
+
+    @objc.typedSelector(b"v@:@")
+    def afterChanged_(self, sender):
+        self.stt.after_action = "enter" if sender.indexOfSelectedItem() == 0 else "nothing"
+        self.stt._save_settings()
+        self._update_description(7)
+
+    @objc.typedSelector(b"v@:@")
+    def targetChanged_(self, sender):
+        self.stt.window_target = "original" if sender.indexOfSelectedItem() == 0 else "active"
+        self.stt._save_settings()
+        self._update_description(8)
+
+    @objc.typedSelector(b"v@:@")
+    def deafenChanged_(self, sender):
+        opts = ["off", "half", "on"]
+        self.stt.deafen_while_recording = opts[sender.indexOfSelectedItem()]
+        self.stt._save_settings()
+        self._update_description(9)
+
+    # ── Key rebinding actions ───────────────────────────────
+
+    def _start_rebind(self, attr, button, row):
+        self._rebinding = attr
+        button.setEnabled_(False)
+        button.setTitle_("Press a key...")
+        self.stt._uninstall_hotkey_tap()
+        self.stt.status = f"Press the new key..."
+        self.stt._needs_redraw = True
+        self._update_description(row)
+
+        def do_rebind():
+            self.stt._rebind_key_via_tap(attr)
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                b"rebindFinished:", None, False
+            )
+        threading.Thread(target=do_rebind, daemon=True).start()
+
+    @objc.typedSelector(b"v@:@")
+    def rebindFinished_(self, _):
+        self._rebinding = None
+        self._refresh_controls()
+        self._hotkey_btn.setEnabled_(True)
+        self._cancel_btn.setEnabled_(True)
+        self._noenter_btn.setEnabled_(True)
+
+    @objc.typedSelector(b"v@:@")
+    def rebindHotkey_(self, sender):
+        self._start_rebind("hotkey", self._hotkey_btn, 3)
+
+    @objc.typedSelector(b"v@:@")
+    def rebindCancel_(self, sender):
+        self._start_rebind("cancel_key", self._cancel_btn, 4)
+
+    @objc.typedSelector(b"v@:@")
+    def rebindNoEnter_(self, sender):
+        self._start_rebind("no_enter_key", self._noenter_btn, 5)
+
+    # ── Window delegate ─────────────────────────────────────
+
+    def windowWillClose_(self, notification):
+        self._timer.invalidate()
+        self.stt.quit_app()
+        NSApplication.sharedApplication().terminate_(None)
 
 
 def parse_args():
