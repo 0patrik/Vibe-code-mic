@@ -45,6 +45,23 @@ python3 app_mac.py
 python app_win.py
 ```
 
+## Build standalone executable
+
+```bash
+source venv/bin/activate  # Windows: venv\Scripts\activate
+pip install pyinstaller
+
+# macOS
+python3 build.py
+# Output: ./dist/vibe-code-mic/vibe-code-mic
+
+# Windows
+python build.py
+# Output: dist\vibe-code-mic\vibe-code-mic.exe
+```
+
+The build script auto-detects the platform and uses the corresponding spec file (`app_mac.spec` or `app_win.spec`).
+
 ## Features
 
 - Fully local — no data sent to the cloud

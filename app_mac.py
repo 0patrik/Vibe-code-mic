@@ -134,6 +134,10 @@ def _get_app_dir():
 
 
 DEFAULT_SETTINGS_PATH = os.path.join(_get_app_dir(), "settings.json5")
+LOG_PATH = os.path.join(_get_app_dir(), "vibe-code-mic.log")
+
+# Open a persistent log file for redirecting library output away from curses
+_log_file = open(LOG_PATH, "a")
 
 # ── Timing & threshold constants ─────────────────────────────────
 MAX_RECORDING_DURATION = 30.0        # seconds - auto-stop recording
@@ -570,20 +574,9 @@ class SpeechToType:
         repo = MLX_MODEL_REPOS[model_name]
         self.status = f"Loading whisper '{model_name}' (MLX)..."
         self._needs_redraw = True
-        t0 = time.perf_counter()
-
-        # Warm up the model by running a tiny silent transcription.
-        # mlx_whisper downloads and caches the model on first use.
-        try:
-            silent = np.zeros(SAMPLE_RATE, dtype=np.float32)  # 1s silence
-            mlx_whisper.transcribe(silent, path_or_hf_repo=repo, language="en")
-        except Exception:
-            pass  # model is still cached even if silence produces no output
-
-        self.model = repo  # store repo path as the "model"
-        elapsed = time.perf_counter() - t0
+        self.model = repo
         self.loaded_model_idx = self.model_idx
-        self.status = f"Ready on MLX (loaded in {elapsed:.1f}s)"
+        self.status = f"Ready ({model_name})"
         self._needs_redraw = True
 
     def _ready_status(self):
@@ -1223,6 +1216,13 @@ class SpeechToType:
         self._install_hotkey_tap()
 
     def run_curses(self, stdscr):
+        # Redirect all stdout/stderr to log file while curses is active
+        sys.stdout, sys.stderr = _log_file, _log_file
+
+        # Clear screen to fix alignment issues in frozen bundles
+        stdscr.clear()
+        stdscr.refresh()
+
         curses.curs_set(0)
         stdscr.nodelay(True)
         stdscr.timeout(CURSES_INPUT_TIMEOUT_MS)
@@ -1240,89 +1240,94 @@ class SpeechToType:
         # Load model and install hotkey tap in background
         threading.Thread(target=self._load_and_hook, daemon=True).start()
 
-        while self._running:
-            # Pump the CFRunLoop so CGEvent tap callbacks fire
-            self._pump_runloop(MAIN_LOOP_PUMP_DURATION)
+        try:
+            while self._running:
+                # Pump the CFRunLoop so CGEvent tap callbacks fire
+                self._pump_runloop(MAIN_LOOP_PUMP_DURATION)
 
-            self._tick_menu_bar()
-            self.draw_ui(stdscr, selected, rebinding)
-            self._needs_redraw = False
-
-            try:
-                key = stdscr.getch()
-            except KeyboardInterrupt:
-                self.status = "Quitting..."
+                self._tick_menu_bar()
                 self.draw_ui(stdscr, selected, rebinding)
-                stdscr.refresh()
-                time.sleep(QUIT_DELAY)
-                break
-            except Exception:
-                key = -1
+                self._needs_redraw = False
 
-            if key == -1:
-                continue
+                try:
+                    key = stdscr.getch()
+                except KeyboardInterrupt:
+                    self.status = "Quitting..."
+                    self.draw_ui(stdscr, selected, rebinding)
+                    stdscr.refresh()
+                    time.sleep(QUIT_DELAY)
+                    break
+                except Exception:
+                    key = -1
 
-            if key == 3:  # Ctrl+C
-                break
+                if key == -1:
+                    continue
 
-            if rebinding:
-                rebinding = False
-                self._needs_redraw = True
-                continue
+                if key == 3:  # Ctrl+C
+                    break
 
-            if key == curses.KEY_UP:
-                selected = (selected - 1) % NUM_SETTINGS
-            elif key == curses.KEY_DOWN:
-                selected = (selected + 1) % NUM_SETTINGS
-            elif key == curses.KEY_LEFT or key == curses.KEY_RIGHT:
-                if selected == 1 and self.input_devices:
-                    if key == curses.KEY_LEFT:
-                        self.device_idx = (self.device_idx - 1) % len(self.input_devices)
-                    else:
-                        self.device_idx = (self.device_idx + 1) % len(self.input_devices)
-                elif selected == 2:
-                    if key == curses.KEY_LEFT:
-                        self.model_idx = (self.model_idx - 1) % len(MODELS)
-                    else:
-                        self.model_idx = (self.model_idx + 1) % len(MODELS)
-                elif selected == 6:
-                    self.mode = "toggle" if self.mode == "push" else "push"
-                elif selected == 7:
-                    self.after_action = "nothing" if self.after_action == "enter" else "enter"
-                elif selected == 8:
-                    self.window_target = "active" if self.window_target == "original" else "original"
-                elif selected == 9:
-                    deafen_options = ["off", "half", "on"]
-                    cur = deafen_options.index(self.deafen_while_recording) if self.deafen_while_recording in deafen_options else 0
-                    if key == curses.KEY_LEFT:
-                        cur = (cur - 1) % len(deafen_options)
-                    else:
-                        cur = (cur + 1) % len(deafen_options)
-                    self.deafen_while_recording = deafen_options[cur]
-                self._save_settings()
-            elif key == 10 or key == curses.KEY_ENTER:
-                if selected == 2:
-                    self._uninstall_hotkey_tap()
+                if rebinding:
+                    rebinding = False
+                    self._needs_redraw = True
+                    continue
+
+                if key == curses.KEY_UP:
+                    selected = (selected - 1) % NUM_SETTINGS
+                elif key == curses.KEY_DOWN:
+                    selected = (selected + 1) % NUM_SETTINGS
+                elif key == curses.KEY_LEFT or key == curses.KEY_RIGHT:
+                    if selected == 1 and self.input_devices:
+                        if key == curses.KEY_LEFT:
+                            self.device_idx = (self.device_idx - 1) % len(self.input_devices)
+                        else:
+                            self.device_idx = (self.device_idx + 1) % len(self.input_devices)
+                    elif selected == 2:
+                        if key == curses.KEY_LEFT:
+                            self.model_idx = (self.model_idx - 1) % len(MODELS)
+                        else:
+                            self.model_idx = (self.model_idx + 1) % len(MODELS)
+                    elif selected == 6:
+                        self.mode = "toggle" if self.mode == "push" else "push"
+                    elif selected == 7:
+                        self.after_action = "nothing" if self.after_action == "enter" else "enter"
+                    elif selected == 8:
+                        self.window_target = "active" if self.window_target == "original" else "original"
+                    elif selected == 9:
+                        deafen_options = ["off", "half", "on"]
+                        cur = deafen_options.index(self.deafen_while_recording) if self.deafen_while_recording in deafen_options else 0
+                        if key == curses.KEY_LEFT:
+                            cur = (cur - 1) % len(deafen_options)
+                        else:
+                            cur = (cur + 1) % len(deafen_options)
+                        self.deafen_while_recording = deafen_options[cur]
                     self._save_settings()
-                    threading.Thread(target=self._load_and_hook, daemon=True).start()
-                elif selected == 3:
-                    rebinding = "hotkey"
-                    self._uninstall_hotkey_tap()
-                    self.status = "Press the new record key..."
-                    self._needs_redraw = True
-                    threading.Thread(target=lambda: self._rebind_key_via_tap("hotkey"), daemon=True).start()
-                elif selected == 4:
-                    rebinding = "cancel"
-                    self._uninstall_hotkey_tap()
-                    self.status = "Press the new cancel key..."
-                    self._needs_redraw = True
-                    threading.Thread(target=lambda: self._rebind_key_via_tap("cancel_key"), daemon=True).start()
-                elif selected == 5:
-                    rebinding = "no_enter"
-                    self._uninstall_hotkey_tap()
-                    self.status = "Press the new cancel+type key..."
-                    self._needs_redraw = True
-                    threading.Thread(target=lambda: self._rebind_key_via_tap("no_enter_key"), daemon=True).start()
+                elif key == 10 or key == curses.KEY_ENTER:
+                    if selected == 2:
+                        self._uninstall_hotkey_tap()
+                        self._save_settings()
+                        threading.Thread(target=self._load_and_hook, daemon=True).start()
+                    elif selected == 3:
+                        rebinding = "hotkey"
+                        self._uninstall_hotkey_tap()
+                        self.status = "Press the new record key..."
+                        self._needs_redraw = True
+                        threading.Thread(target=lambda: self._rebind_key_via_tap("hotkey"), daemon=True).start()
+                    elif selected == 4:
+                        rebinding = "cancel"
+                        self._uninstall_hotkey_tap()
+                        self.status = "Press the new cancel key..."
+                        self._needs_redraw = True
+                        threading.Thread(target=lambda: self._rebind_key_via_tap("cancel_key"), daemon=True).start()
+                    elif selected == 5:
+                        rebinding = "no_enter"
+                        self._uninstall_hotkey_tap()
+                        self.status = "Press the new cancel+type key..."
+                        self._needs_redraw = True
+                        threading.Thread(target=lambda: self._rebind_key_via_tap("no_enter_key"), daemon=True).start()
+        finally:
+            _log_file.flush()
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
 
     def _load_and_hook(self):
         self.load_model()
@@ -1338,7 +1343,6 @@ class SpeechToType:
 
     def run(self):
         curses.wrapper(self.run_curses)
-        print("Quitting...")
         self.quit_app()
 
 

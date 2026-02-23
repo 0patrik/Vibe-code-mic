@@ -1,33 +1,41 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller spec file for vibe-code-mic (macOS)."""
 
-import sys
-import os
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
+
+# Collect mlx and mlx_whisper with all their data files and binaries
+mlx_datas, mlx_binaries, mlx_hidden = collect_all('mlx')
+mlx_whisper_datas, mlx_whisper_binaries, mlx_whisper_hidden = collect_all('mlx_whisper')
+mlx_metal_datas, mlx_metal_binaries, mlx_metal_hidden = collect_all('mlx_metal')
+
+all_datas = mlx_datas + mlx_whisper_datas + mlx_metal_datas
+all_binaries = mlx_binaries + mlx_whisper_binaries + mlx_metal_binaries
+all_hiddenimports = mlx_hidden + mlx_whisper_hidden + mlx_metal_hidden + [
+    'sounddevice',
+    '_sounddevice_data',
+    'json5',
+    'numpy',
+    'AppKit',
+    'Quartz',
+    'Foundation',
+    'CoreFoundation',
+    'ApplicationServices',
+    'objc',
+    'PyObjCTools',
+    'huggingface_hub',
+    'tiktoken',
+    'scipy',
+    'numba',
+]
 
 a = Analysis(
     ['app_mac.py'],
     pathex=[],
-    binaries=[],
-    datas=[],
-    hiddenimports=[
-        'mlx',
-        'mlx.core',
-        'mlx.nn',
-        'mlx_whisper',
-        'sounddevice',
-        '_sounddevice_data',
-        'json5',
-        'numpy',
-        'AppKit',
-        'Quartz',
-        'Foundation',
-        'CoreFoundation',
-        'ApplicationServices',
-        'objc',
-        'PyObjCTools',
-    ],
+    binaries=all_binaries,
+    datas=all_datas,
+    hiddenimports=all_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
