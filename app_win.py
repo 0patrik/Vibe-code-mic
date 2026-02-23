@@ -45,7 +45,16 @@ class GUITHREADINFO(ctypes.Structure):
 VERSION = "1.0.0"
 MODELS = ["tiny", "base", "small", "medium", "large"]
 SAMPLE_RATE = 16000
-DEFAULT_SETTINGS_PATH = "./settings.json5"
+
+
+def _get_app_dir():
+    """Return the directory containing the executable (frozen) or script."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+DEFAULT_SETTINGS_PATH = os.path.join(_get_app_dir(), "settings.json5")
 
 
 def get_input_devices():
