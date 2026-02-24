@@ -218,6 +218,17 @@ _log_file = open(LOG_PATH, "a")
 sys.stdout = _log_file
 sys.stderr = _log_file
 
+
+def _dlog(msg):
+    """Write a timestamped diagnostic line to the log file."""
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        tid = threading.current_thread().name
+        _log_file.write(f"[{ts}] [{tid}] {msg}\n")
+        _log_file.flush()
+    except Exception:
+        pass
+
 # ── Timing & threshold constants ─────────────────────────────────
 MAX_RECORDING_DURATION = 30.0        # seconds - auto-stop recording
 MIN_AUDIO_DURATION = 0.3             # seconds - skip if shorter
@@ -528,8 +539,11 @@ class SpeechToType:
         keystrokes are buffered (not logged) and replayed immediately after.
         """
         if event_type in (kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput):
+            reason = "timeout" if event_type == kCGEventTapDisabledByTimeout else "user_input"
+            _dlog(f"[tap] DISABLED by {reason}, recording={self._recording}, key_held={self._key_held}")
             if self._tap_port is not None:
                 CGEventTapEnable(self._tap_port, True)
+                _dlog("[tap] re-enabled")
             return event
 
         # During paste: let our synthetic events through, capture everything else
@@ -669,11 +683,15 @@ class SpeechToType:
         return "Ready"
 
     def _audio_callback(self, indata, frames, time_info, status):
+        if status:
+            _dlog(f"[audio_cb] sounddevice status: {status}")
         self._chunks.append(indata.copy())
         if self._record_start_time and (time.perf_counter() - self._record_start_time) >= MAX_RECORDING_DURATION:
+            _dlog("[audio_cb] MAX_RECORDING_DURATION reached, triggering stop")
             threading.Thread(target=self._stop_recording, daemon=True).start()
 
     def _on_hotkey_event(self, direction):
+        _dlog(f"[hotkey] direction={direction} mode={self.mode} recording={self._recording} key_held={self._key_held}")
         if self.mode == "push":
             if direction == "down":
                 if self._key_held:
@@ -696,6 +714,7 @@ class SpeechToType:
                 self._key_held = False
 
     def _on_cancel_event(self):
+        _dlog(f"[cancel] recording={self._recording}")
         if self._recording:
             self._recording = False
             self._record_start_time = None
@@ -726,8 +745,10 @@ class SpeechToType:
             self._target_app_ref, self._target_window_ref = get_ax_focused_window(pid)
 
     def _start_recording(self):
+        _dlog("[start_recording] enter")
         with self._recording_lock:
             if self._recording:
+                _dlog("[start_recording] already recording, bail")
                 return
             self._recording = True
         self._skip_enter = False
@@ -737,6 +758,7 @@ class SpeechToType:
 
         try:
             dev_index = self.input_devices[self.device_idx][0] if self.input_devices else None
+            _dlog(f"[start_recording] opening stream, device={dev_index}")
             self._stream = sd.InputStream(
                 samplerate=SAMPLE_RATE,
                 channels=1,
@@ -745,7 +767,9 @@ class SpeechToType:
                 callback=self._audio_callback,
             )
             self._stream.start()
+            _dlog("[start_recording] stream started")
         except Exception as e:
+            _dlog(f"[start_recording] FAILED: {e}")
             self._recording = False
             self.status = f"Recording failed: {e}"
             self._needs_redraw = True
@@ -755,28 +779,37 @@ class SpeechToType:
             self._mute_system()
         self.status = f"Recording... 0.0s / {MAX_RECORDING_DURATION:.0f}s"
         self._needs_redraw = True
+        _dlog("[start_recording] done")
 
     def _stop_recording(self):
+        _dlog("[stop_recording] enter")
         with self._recording_lock:
             if not self._recording:
+                _dlog("[stop_recording] not recording, bail")
                 return
             self._recording = False
         self._record_start_time = None
         if self._stream:
+            _dlog("[stop_recording] stopping stream...")
+            t0 = time.perf_counter()
             self._stream.stop()
+            _dlog(f"[stop_recording] stream.stop() took {time.perf_counter()-t0:.3f}s")
             self._stream.close()
             self._stream = None
+            _dlog("[stop_recording] stream closed")
 
         if self.deafen_while_recording != "off":
             self._unmute_system()
 
         if not self._chunks:
+            _dlog("[stop_recording] no chunks, done")
             self.status = self._ready_status()
             self._needs_redraw = True
             return
 
         audio = np.concatenate(self._chunks, axis=0).flatten()
         duration = len(audio) / SAMPLE_RATE
+        _dlog(f"[stop_recording] chunks={len(self._chunks)} duration={duration:.2f}s")
 
         if duration < MIN_AUDIO_DURATION:
             self.status = "Too short, skipped"
@@ -785,15 +818,24 @@ class SpeechToType:
 
         self.status = f"Transcribing {duration:.1f}s of audio..."
         self._needs_redraw = True
+        _dlog("[stop_recording] spawning transcribe thread")
         threading.Thread(target=self._transcribe_and_type, args=(audio,), daemon=True).start()
 
     def _transcribe_and_type(self, audio):
+        _dlog(f"[transcribe] starting, audio length={len(audio)/SAMPLE_RATE:.2f}s")
         t0 = time.perf_counter()
-        result = mlx_whisper.transcribe(
-            audio, path_or_hf_repo=self.model, language="en"
-        )
+        try:
+            result = mlx_whisper.transcribe(
+                audio, path_or_hf_repo=self.model, language="en"
+            )
+        except Exception as e:
+            _dlog(f"[transcribe] FAILED: {e}")
+            self.status = f"Transcription failed: {e}"
+            self._needs_redraw = True
+            return
         text = result["text"].strip()
         elapsed = time.perf_counter() - t0
+        _dlog(f"[transcribe] done in {elapsed:.2f}s, text_len={len(text)}")
 
         if not text:
             self.status = "No speech detected"
@@ -809,7 +851,9 @@ class SpeechToType:
             self.status = self._ready_status()
         self._needs_redraw = True
 
+        _dlog("[transcribe] starting paste workflow")
         self._type_text_into_target(text)
+        _dlog("[transcribe] paste workflow done")
 
     # ── Paste workflow ── # ~~~ SECURITY-SENSITIVE ~~~
     # Reads/writes system clipboard, posts synthetic keyboard events,
@@ -1069,10 +1113,11 @@ class SpeechToType:
         cross-process windows, and temporarily captures all keystrokes.
         Wrapped in try/finally to guarantee cleanup on any failure.
         """
+        _dlog(f"[type_into_target] enter, text_len={len(text)}, skip_enter={self._skip_enter}, "
+              f"window_target={self.window_target}, target_app={self._target_app}")
         targets = self._resolve_paste_targets()
         if targets is None:
-            _log_file.write("[paste] _resolve_paste_targets returned None\n")
-            _log_file.flush()
+            _dlog("[type_into_target] _resolve_paste_targets returned None, aborting")
             return
         (workspace, return_to_app, return_to_app_ref,
          return_to_window_ref, target_app, target_window_ref) = targets
@@ -1452,6 +1497,16 @@ class AppDelegate(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def tick_(self, timer):
+        now = time.perf_counter()
+        # Detect main thread stalls (tick fires every 0.1s, warn if gap > 1s)
+        if hasattr(self, '_last_tick_time'):
+            gap = now - self._last_tick_time
+            if gap > 1.0:
+                _dlog(f"[tick] STALL detected: {gap:.2f}s since last tick, "
+                      f"recording={self.stt._recording}, key_held={self.stt._key_held}, "
+                      f"status={self.stt.status!r}")
+        self._last_tick_time = now
+
         stt = self.stt
         stt._tick_menu_bar()
 
