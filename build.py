@@ -34,7 +34,7 @@ def main():
         print()
         print("Build successful!")
         if system == "Darwin":
-            print("Run with: ./dist/vibe-code-mic/vibe-code-mic")
+            print("Run with: open dist/vibe-code-mic.app")
         else:
             print(r"Run with: dist\vibe-code-mic\vibe-code-mic.exe")
     else:

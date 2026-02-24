@@ -58,7 +58,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -75,4 +75,19 @@ coll = COLLECT(
     upx=True,
     upx_exclude=[],
     name='vibe-code-mic',
+)
+
+app = BUNDLE(
+    coll,
+    name='vibe-code-mic.app',
+    icon='app_icon.icns',
+    bundle_identifier='com.vibe-code-mic.app',
+    info_plist={
+        'CFBundleName': 'vibe-code-mic',
+        'CFBundleDisplayName': 'vibe-code-mic',
+        'CFBundleShortVersionString': '1.0.0',
+        'NSMicrophoneUsageDescription': 'vibe-code-mic needs microphone access to record speech for transcription.',
+        'LSUIElement': False,
+    },
+    console=False,
 )

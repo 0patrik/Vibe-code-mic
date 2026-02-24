@@ -53,7 +53,7 @@ pip install pyinstaller
 
 # macOS
 python3 build.py
-# Output: ./dist/vibe-code-mic/vibe-code-mic
+# Output: dist/vibe-code-mic.app (open with: open dist/vibe-code-mic.app)
 
 # Windows
 python build.py

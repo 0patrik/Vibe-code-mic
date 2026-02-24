@@ -842,6 +842,16 @@ class SpeechToType:
         if not target_app:
             return None
 
+        # Diagnostic logging for return-to window refs
+        rt_name = return_to_app.localizedName() if return_to_app else "None"
+        rt_pid = return_to_app.processIdentifier() if return_to_app else 0
+        rt_win_title = ax_get_title(return_to_window_ref) if return_to_window_ref else "(no window ref)"
+        _log_file.write(f"[resolve] return_to_app={rt_name} pid={rt_pid}"
+                        f" app_ref={'set' if return_to_app_ref else 'None'}"
+                        f" window_ref={'set' if return_to_window_ref else 'None'}"
+                        f" window_title={rt_win_title}\n")
+        _log_file.flush()
+
         return (workspace, return_to_app, return_to_app_ref,
                 return_to_window_ref, target_app, target_window_ref)
 
@@ -875,18 +885,56 @@ class SpeechToType:
         needs_window_raise = (same_app and target_window_ref
                               and target_window_ref != return_to_window_ref)
 
+        front_name = front.localizedName() if front else "None"
+        _log_file.write(f"[switch] front={front_name} pid={front.processIdentifier() if front else 0}"
+                        f" target_pid={target_pid} same_app={same_app}"
+                        f" needs_switch={needs_switch} needs_raise={needs_window_raise}\n")
+        _log_file.flush()
+
         if needs_switch:
             target_app_ref, _ = get_ax_focused_window(target_pid)
             target_app.activateWithOptions_(0)
+            # Raise the specific window immediately after activation request
             if target_window_ref:
                 ax_raise_window(target_window_ref)
                 if target_app_ref:
                     ax_set_focused_window(target_app_ref, target_window_ref)
-            for _ in range(WINDOW_SWITCH_MAX_POLLS):
+            # Poll until macOS confirms the switch
+            for i in range(WINDOW_SWITCH_MAX_POLLS):
                 CFRunLoopRunInMode(_rl, WINDOW_SWITCH_POLL_INTERVAL, False)
                 front = workspace.frontmostApplication()
                 if front and front.processIdentifier() == target_pid:
+                    _log_file.write(f"[switch] target switch confirmed after {i+1} polls\n")
+                    _log_file.flush()
                     break
+            # Verify switch actually happened; fall back to osascript if not
+            front = workspace.frontmostApplication()
+            if not front or front.processIdentifier() != target_pid:
+                _log_file.write(f"[switch] activateWithOptions_ failed"
+                                f" (front={front.localizedName() if front else 'None'}"
+                                f" pid={front.processIdentifier() if front else 0}),"
+                                f" falling back to osascript\n")
+                _log_file.flush()
+                bundle_id = target_app.bundleIdentifier()
+                if bundle_id:
+                    subprocess.run(
+                        ["osascript", "-e",
+                         f'tell application id "{bundle_id}" to activate'],
+                        stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        timeout=3,
+                    )
+                    CFRunLoopRunInMode(_rl, POST_SWITCH_SETTLE, False)
+                    # Re-raise specific window after osascript activate
+                    if target_window_ref:
+                        ax_raise_window(target_window_ref)
+                        if target_app_ref:
+                            ax_set_focused_window(target_app_ref, target_window_ref)
+                    front = workspace.frontmostApplication()
+                    if front and front.processIdentifier() == target_pid:
+                        _log_file.write("[switch] osascript fallback succeeded\n")
+                    else:
+                        _log_file.write("[switch] osascript fallback also failed\n")
+                    _log_file.flush()
         elif needs_window_raise:
             target_app_ref, _ = get_ax_focused_window(target_pid)
             ax_raise_window(target_window_ref)
@@ -931,13 +979,57 @@ class SpeechToType:
         keystroke events back into the system event stream.
         """
         if (needs_switch or needs_window_raise) and return_to_app:
+            return_to_pid = return_to_app.processIdentifier()
+            return_to_name = return_to_app.localizedName()
+            rt_win_title = ax_get_title(return_to_window_ref) if return_to_window_ref else "(no ref)"
+            _log_file.write(f"[switch-back] app={return_to_name} pid={return_to_pid}"
+                            f" app_ref={'set' if return_to_app_ref else 'None'}"
+                            f" window_ref={'set' if return_to_window_ref else 'None'}"
+                            f" window_title={rt_win_title}"
+                            f" needs_switch={needs_switch} needs_raise={needs_window_raise}\n")
+            _log_file.flush()
+
             if needs_switch:
                 return_to_app.activateWithOptions_(0)
+            # Raise the specific window
             if return_to_window_ref:
                 ax_raise_window(return_to_window_ref)
                 if return_to_app_ref:
                     ax_set_focused_window(return_to_app_ref, return_to_window_ref)
             self._pump_runloop_for(SWITCH_BACK_DELAY)
+
+            # Verify switch actually happened; fall back to osascript if not
+            front = workspace.frontmostApplication()
+            front_pid = front.processIdentifier() if front else 0
+            if front_pid != return_to_pid:
+                _log_file.write(f"[switch-back] activateWithOptions_ failed"
+                                f" (front={front.localizedName() if front else 'None'} pid={front_pid}),"
+                                f" falling back to osascript\n")
+                _log_file.flush()
+                bundle_id = return_to_app.bundleIdentifier()
+                if bundle_id:
+                    subprocess.run(
+                        ["osascript", "-e",
+                         f'tell application id "{bundle_id}" to activate'],
+                        stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        timeout=3,
+                    )
+                    self._pump_runloop_for(SWITCH_BACK_DELAY)
+                    # Re-raise specific window after osascript activate
+                    if return_to_window_ref:
+                        ax_raise_window(return_to_window_ref)
+                        if return_to_app_ref:
+                            ax_set_focused_window(return_to_app_ref, return_to_window_ref)
+                    self._pump_runloop_for(POST_SWITCH_SETTLE)
+                    front = workspace.frontmostApplication()
+                    front_pid = front.processIdentifier() if front else 0
+                    _log_file.write(f"[switch-back] after osascript:"
+                                    f" front={front.localizedName() if front else 'None'}"
+                                    f" pid={front_pid} success={front_pid == return_to_pid}\n")
+                    _log_file.flush()
+            else:
+                _log_file.write(f"[switch-back] activate succeeded\n")
+                _log_file.flush()
 
         self._paste_capturing = False
         self._pump_runloop_for(PRE_REPLAY_DELAY)
@@ -979,9 +1071,16 @@ class SpeechToType:
         """
         targets = self._resolve_paste_targets()
         if targets is None:
+            _log_file.write("[paste] _resolve_paste_targets returned None\n")
+            _log_file.flush()
             return
         (workspace, return_to_app, return_to_app_ref,
          return_to_window_ref, target_app, target_window_ref) = targets
+
+        _log_file.write(f"[paste] target_app={target_app.localizedName()} pid={target_app.processIdentifier()}"
+                        f" target_window={target_window_ref is not None}"
+                        f" return_to={return_to_app.localizedName() if return_to_app else None}\n")
+        _log_file.flush()
 
         pb, old_clipboard = self._save_and_set_clipboard(text)
 
