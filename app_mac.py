@@ -355,9 +355,13 @@ class SpeechToType:
         self._key_held = False
         self._recording = False
         self._recording_lock = threading.Lock()
-        self._stream_active = False  # guards audio callback against use-after-free
+        self._stream_active = False  # guards audio callback; stream stays open
         self._chunks = []
         self._stream = None
+        self._stream_device = None  # tracks which device the persistent stream uses
+        self._recording_session = 0  # monotonic counter for log correlation
+        self._cb_count = 0           # callback invocations in current session
+        self._cb_last_log_time = 0   # last time we logged a heartbeat
 
         # macOS target window state
         self._target_app = None
@@ -686,12 +690,90 @@ class SpeechToType:
     def _audio_callback(self, indata, frames, time_info, status):
         if not self._stream_active:
             return
+        self._cb_count += 1
         if status:
-            _dlog(f"[audio_cb] sounddevice status: {status}")
+            _dlog(f"[audio_cb] s{self._recording_session} sounddevice status: {status}")
+        # Heartbeat: log every ~5 seconds so we can tell the callback is alive
+        now = time.perf_counter()
+        if now - self._cb_last_log_time >= 5.0:
+            elapsed = now - self._record_start_time if self._record_start_time else 0
+            _dlog(f"[audio_cb] s{self._recording_session} heartbeat: "
+                  f"cb_count={self._cb_count} chunks={len(self._chunks)} "
+                  f"elapsed={elapsed:.1f}s frames={frames}")
+            self._cb_last_log_time = now
         self._chunks.append(indata.copy())
-        if self._record_start_time and (time.perf_counter() - self._record_start_time) >= MAX_RECORDING_DURATION:
+        if self._record_start_time and (now - self._record_start_time) >= MAX_RECORDING_DURATION:
             _dlog("[audio_cb] MAX_RECORDING_DURATION reached, triggering stop")
             threading.Thread(target=self._stop_recording, daemon=True).start()
+
+    def _ensure_stream(self):
+        """Create the audio stream once and reuse it across recordings.
+
+        The stream stays open between recordings — the callback is a no-op
+        when _stream_active is False.  This avoids Pa_AbortStream /
+        Pa_StopStream deadlocks on macOS CoreAudio.
+        """
+        dev_index = self.input_devices[self.device_idx][0] if self.input_devices else None
+
+        # Reuse existing stream if it's still alive and on the same device
+        if self._stream is not None:
+            try:
+                s = self._stream
+                _dlog(f"[ensure_stream] existing stream: active={s.active} "
+                      f"closed={s.closed} stopped={s.stopped} "
+                      f"device={self._stream_device} wanted={dev_index}")
+                if s.active or not s.closed:
+                    if self._stream_device == dev_index:
+                        _dlog("[ensure_stream] reusing existing stream")
+                        return
+                    # Device changed — close old stream
+                    _dlog("[ensure_stream] device changed, closing old stream")
+                    self._close_stream()
+                else:
+                    _dlog("[ensure_stream] stream is closed/stopped, will recreate")
+                    self._stream = None
+                    self._stream_device = None
+            except Exception as e:
+                _dlog(f"[ensure_stream] stream check error: {e}")
+                self._stream = None
+                self._stream_device = None
+
+        _dlog(f"[ensure_stream] opening new stream, device={dev_index}")
+        self._stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            device=dev_index,
+            callback=self._audio_callback,
+        )
+        self._stream.start()
+        self._stream_device = dev_index
+        _dlog(f"[ensure_stream] stream started, active={self._stream.active}")
+
+    def _close_stream(self):
+        """Close the persistent stream (device change or app exit only)."""
+        self._stream_active = False
+        if self._stream is not None:
+            try:
+                s = self._stream
+                _dlog(f"[close_stream] stream state: active={s.active} "
+                      f"closed={s.closed} stopped={s.stopped}")
+            except Exception:
+                pass
+            t0 = time.perf_counter()
+            try:
+                _dlog("[close_stream] calling abort()...")
+                self._stream.abort()
+                _dlog(f"[close_stream] abort() took {time.perf_counter()-t0:.3f}s")
+                time.sleep(0.05)
+                _dlog("[close_stream] calling close()...")
+                self._stream.close()
+                _dlog(f"[close_stream] close() took {time.perf_counter()-t0:.3f}s total")
+            except Exception as e:
+                _dlog(f"[close_stream] error after {time.perf_counter()-t0:.3f}s: {e}")
+            self._stream = None
+            self._stream_device = None
+            _dlog("[close_stream] done")
 
     def _on_hotkey_event(self, direction):
         _dlog(f"[hotkey] direction={direction} mode={self.mode} recording={self._recording} key_held={self._key_held}")
@@ -717,21 +799,16 @@ class SpeechToType:
                 self._key_held = False
 
     def _on_cancel_event(self):
-        _dlog(f"[cancel] recording={self._recording}")
+        sid = self._recording_session
+        _dlog(f"[cancel] s{sid} recording={self._recording} "
+              f"stream_active={self._stream_active} cb_count={self._cb_count} "
+              f"chunks={len(self._chunks)} stream={self._stream is not None}")
         with self._recording_lock:
             if not self._recording:
                 return
             self._recording = False
         self._record_start_time = None
-        self._stream_active = False  # tell audio callback to bail out
-        if self._stream:
-            try:
-                self._stream.abort()
-                time.sleep(0.05)
-                self._stream.close()
-            except Exception as e:
-                _dlog(f"[cancel] stream cleanup error: {e}")
-            self._stream = None
+        self._stream_active = False  # callback becomes a no-op; stream stays open
         self._chunks = []
         if self.deafen_while_recording != "off":
             self._unmute_system()
@@ -755,32 +832,29 @@ class SpeechToType:
             self._target_app_ref, self._target_window_ref = get_ax_focused_window(pid)
 
     def _start_recording(self):
-        _dlog("[start_recording] enter")
+        self._recording_session += 1
+        sid = self._recording_session
+        _dlog(f"[start_recording] s{sid} enter | "
+              f"recording={self._recording} stream_active={self._stream_active} "
+              f"key_held={self._key_held} stream={self._stream is not None}")
         with self._recording_lock:
             if self._recording:
-                _dlog("[start_recording] already recording, bail")
+                _dlog(f"[start_recording] s{sid} already recording, bail")
                 return
             self._recording = True
         self._skip_enter = False
         self._chunks = []
+        self._cb_count = 0
+        self._cb_last_log_time = 0
 
         self._capture_target_window()
 
         try:
-            dev_index = self.input_devices[self.device_idx][0] if self.input_devices else None
-            _dlog(f"[start_recording] opening stream, device={dev_index}")
-            self._stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype="float32",
-                device=dev_index,
-                callback=self._audio_callback,
-            )
+            self._ensure_stream()
             self._stream_active = True
-            self._stream.start()
-            _dlog("[start_recording] stream started")
+            _dlog(f"[start_recording] s{sid} stream active")
         except Exception as e:
-            _dlog(f"[start_recording] FAILED: {e}")
+            _dlog(f"[start_recording] s{sid} FAILED: {e}")
             self._stream_active = False
             self._recording = False
             self.status = f"Recording failed: {e}"
@@ -791,31 +865,24 @@ class SpeechToType:
             self._mute_system()
         self.status = f"Recording... 0.0s / {MAX_RECORDING_DURATION:.0f}s"
         self._needs_redraw = True
-        _dlog("[start_recording] done")
+        _dlog(f"[start_recording] s{sid} done")
 
     def _stop_recording(self):
-        _dlog("[stop_recording] enter")
+        sid = self._recording_session
+        _dlog(f"[stop_recording] s{sid} enter | "
+              f"recording={self._recording} stream_active={self._stream_active} "
+              f"key_held={self._key_held} cb_count={self._cb_count} "
+              f"chunks={len(self._chunks)} stream={self._stream is not None}")
         with self._recording_lock:
             if not self._recording:
-                _dlog("[stop_recording] not recording, bail")
+                _dlog(f"[stop_recording] s{sid} not recording, bail")
                 return
             self._recording = False
+        elapsed = time.perf_counter() - self._record_start_time if self._record_start_time else 0
         self._record_start_time = None
-        self._stream_active = False  # tell audio callback to bail out immediately
-        if self._stream:
-            _dlog("[stop_recording] stopping stream...")
-            t0 = time.perf_counter()
-            try:
-                self._stream.abort()
-                _dlog(f"[stop_recording] stream.abort() took {time.perf_counter()-t0:.3f}s")
-                # Give CoreAudio IO thread time to fully exit the callback
-                # before freeing the FFI closure via close().
-                time.sleep(0.05)
-                self._stream.close()
-            except Exception as e:
-                _dlog(f"[stop_recording] stream cleanup error: {e}")
-            self._stream = None
-            _dlog("[stop_recording] stream closed")
+        self._stream_active = False  # callback becomes a no-op; stream stays open
+        _dlog(f"[stop_recording] s{sid} deactivated (kept open) | "
+              f"elapsed={elapsed:.2f}s cb_count={self._cb_count}")
 
         if self.deafen_while_recording != "off":
             self._unmute_system()
@@ -1299,6 +1366,7 @@ class SpeechToType:
         self._needs_redraw = True
         self._save_settings()
         self._running = False
+        self._close_stream()
         self._uninstall_hotkey_tap()
         NSStatusBar.systemStatusBar().removeStatusItem_(self._status_item)
 
@@ -1546,6 +1614,7 @@ class AppDelegate(NSObject):
     def deviceChanged_(self, sender):
         idx = sender.indexOfSelectedItem()
         if self.stt.input_devices and 0 <= idx < len(self.stt.input_devices):
+            self.stt._close_stream()  # close old device stream; will reopen on next recording
             self.stt.device_idx = idx
             self.stt._save_settings()
         self._update_description(1)
