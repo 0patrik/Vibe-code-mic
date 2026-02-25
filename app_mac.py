@@ -355,6 +355,7 @@ class SpeechToType:
         self._key_held = False
         self._recording = False
         self._recording_lock = threading.Lock()
+        self._stream_active = False  # guards audio callback against use-after-free
         self._chunks = []
         self._stream = None
 
@@ -683,6 +684,8 @@ class SpeechToType:
         return "Ready"
 
     def _audio_callback(self, indata, frames, time_info, status):
+        if not self._stream_active:
+            return
         if status:
             _dlog(f"[audio_cb] sounddevice status: {status}")
         self._chunks.append(indata.copy())
@@ -715,19 +718,25 @@ class SpeechToType:
 
     def _on_cancel_event(self):
         _dlog(f"[cancel] recording={self._recording}")
-        if self._recording:
+        with self._recording_lock:
+            if not self._recording:
+                return
             self._recording = False
-            self._record_start_time = None
-            if self._stream:
+        self._record_start_time = None
+        self._stream_active = False  # tell audio callback to bail out
+        if self._stream:
+            try:
                 self._stream.stop()
                 self._stream.close()
-                self._stream = None
-            self._chunks = []
-            if self.deafen_while_recording != "off":
-                self._unmute_system()
-            self._key_held = False
-            self.status = "Cancelled"
-            self._needs_redraw = True
+            except Exception as e:
+                _dlog(f"[cancel] stream cleanup error: {e}")
+            self._stream = None
+        self._chunks = []
+        if self.deafen_while_recording != "off":
+            self._unmute_system()
+        self._key_held = False
+        self.status = "Cancelled"
+        self._needs_redraw = True
 
     def _on_no_enter_event(self):
         if self._recording:
@@ -766,10 +775,12 @@ class SpeechToType:
                 device=dev_index,
                 callback=self._audio_callback,
             )
+            self._stream_active = True
             self._stream.start()
             _dlog("[start_recording] stream started")
         except Exception as e:
             _dlog(f"[start_recording] FAILED: {e}")
+            self._stream_active = False
             self._recording = False
             self.status = f"Recording failed: {e}"
             self._needs_redraw = True
@@ -789,12 +800,16 @@ class SpeechToType:
                 return
             self._recording = False
         self._record_start_time = None
+        self._stream_active = False  # tell audio callback to bail out immediately
         if self._stream:
             _dlog("[stop_recording] stopping stream...")
             t0 = time.perf_counter()
-            self._stream.stop()
-            _dlog(f"[stop_recording] stream.stop() took {time.perf_counter()-t0:.3f}s")
-            self._stream.close()
+            try:
+                self._stream.stop()
+                _dlog(f"[stop_recording] stream.stop() took {time.perf_counter()-t0:.3f}s")
+                self._stream.close()
+            except Exception as e:
+                _dlog(f"[stop_recording] stream cleanup error: {e}")
             self._stream = None
             _dlog("[stop_recording] stream closed")
 
