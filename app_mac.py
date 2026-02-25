@@ -726,7 +726,8 @@ class SpeechToType:
         self._stream_active = False  # tell audio callback to bail out
         if self._stream:
             try:
-                self._stream.stop()
+                self._stream.abort()
+                time.sleep(0.05)
                 self._stream.close()
             except Exception as e:
                 _dlog(f"[cancel] stream cleanup error: {e}")
@@ -805,8 +806,11 @@ class SpeechToType:
             _dlog("[stop_recording] stopping stream...")
             t0 = time.perf_counter()
             try:
-                self._stream.stop()
-                _dlog(f"[stop_recording] stream.stop() took {time.perf_counter()-t0:.3f}s")
+                self._stream.abort()
+                _dlog(f"[stop_recording] stream.abort() took {time.perf_counter()-t0:.3f}s")
+                # Give CoreAudio IO thread time to fully exit the callback
+                # before freeing the FFI closure via close().
+                time.sleep(0.05)
                 self._stream.close()
             except Exception as e:
                 _dlog(f"[stop_recording] stream cleanup error: {e}")
