@@ -1094,9 +1094,11 @@ class SpeechToType:
         if self.after_action == "enter" and not self._skip_enter:
             self._pump_runloop_for(PASTE_PRE_ENTER_DELAY)
             down = CGEventCreateKeyboardEvent(src, 0x24, True)
+            CGEventSetFlags(down, 0)
             CGEventPost(kCGHIDEventTap, down)
             self._pump_runloop_for(ENTER_KEY_DOWN_DELAY)
             up = CGEventCreateKeyboardEvent(src, 0x24, False)
+            CGEventSetFlags(up, 0)
             CGEventPost(kCGHIDEventTap, up)
 
         self._pump_runloop_for(PASTE_SETTLE_DELAY)
