@@ -362,6 +362,7 @@ class SpeechToType:
         self._recording_session = 0  # monotonic counter for log correlation
         self._cb_count = 0           # callback invocations in current session
         self._cb_last_log_time = 0   # last time we logged a heartbeat
+        self._auto_stop_triggered = False  # one-shot latch for MAX_RECORDING_DURATION
 
         # macOS target window state
         self._target_app = None
@@ -687,8 +688,21 @@ class SpeechToType:
             return "Ready on MLX"
         return "Ready"
 
+    def _debug_state(self):
+        return (f"recording={self._recording} stream_active={self._stream_active} "
+                f"key_held={self._key_held} start_time_set={self._record_start_time is not None} "
+                f"auto_stop={self._auto_stop_triggered} cb_count={self._cb_count} "
+                f"chunks={len(self._chunks)} stream={self._stream is not None}")
+
     def _audio_callback(self, indata, frames, time_info, status):
         if not self._stream_active:
+            return
+        if not self._recording:
+            _dlog(f"[audio_cb] s{self._recording_session} invalid state: callback fired while "
+                  f"stream active but not recording; disabling stream | {self._debug_state()}")
+            self._stream_active = False
+            self._record_start_time = None
+            self._auto_stop_triggered = False
             return
         self._cb_count += 1
         if status:
@@ -702,8 +716,12 @@ class SpeechToType:
                   f"elapsed={elapsed:.1f}s frames={frames}")
             self._cb_last_log_time = now
         self._chunks.append(indata.copy())
-        if self._record_start_time and (now - self._record_start_time) >= MAX_RECORDING_DURATION:
-            _dlog("[audio_cb] MAX_RECORDING_DURATION reached, triggering stop")
+        if (self._record_start_time and not self._auto_stop_triggered
+                and (now - self._record_start_time) >= MAX_RECORDING_DURATION):
+            self._auto_stop_triggered = True
+            elapsed = now - self._record_start_time
+            _dlog(f"[audio_cb] s{self._recording_session} MAX_RECORDING_DURATION reached at "
+                  f"{elapsed:.2f}s, triggering stop | {self._debug_state()}")
             threading.Thread(target=self._stop_recording, daemon=True).start()
 
     def _ensure_stream(self):
@@ -800,16 +818,17 @@ class SpeechToType:
 
     def _on_cancel_event(self):
         sid = self._recording_session
-        _dlog(f"[cancel] s{sid} recording={self._recording} "
-              f"stream_active={self._stream_active} cb_count={self._cb_count} "
-              f"chunks={len(self._chunks)} stream={self._stream is not None}")
+        _dlog(f"[cancel] s{sid} enter | {self._debug_state()}")
         with self._recording_lock:
             if not self._recording:
+                _dlog(f"[cancel] s{sid} not recording, bail")
                 return
             self._recording = False
         self._record_start_time = None
+        self._auto_stop_triggered = False
         self._stream_active = False  # callback becomes a no-op; stream stays open
         self._chunks = []
+        _dlog(f"[cancel] s{sid} deactivated | {self._debug_state()}")
         if self.deafen_while_recording != "off":
             self._unmute_system()
         self._key_held = False
@@ -834,9 +853,7 @@ class SpeechToType:
     def _start_recording(self):
         self._recording_session += 1
         sid = self._recording_session
-        _dlog(f"[start_recording] s{sid} enter | "
-              f"recording={self._recording} stream_active={self._stream_active} "
-              f"key_held={self._key_held} stream={self._stream is not None}")
+        _dlog(f"[start_recording] s{sid} enter | {self._debug_state()}")
         with self._recording_lock:
             if self._recording:
                 _dlog(f"[start_recording] s{sid} already recording, bail")
@@ -846,43 +863,58 @@ class SpeechToType:
         self._chunks = []
         self._cb_count = 0
         self._cb_last_log_time = 0
+        self._auto_stop_triggered = False
 
         self._capture_target_window()
 
         try:
             self._ensure_stream()
-            self._stream_active = True
-            _dlog(f"[start_recording] s{sid} stream active")
+            with self._recording_lock:
+                if not self._recording:
+                    _dlog(f"[start_recording] s{sid} cancelled during stream setup; "
+                          f"leaving stream idle | {self._debug_state()}")
+                    self._record_start_time = None
+                    self._auto_stop_triggered = False
+                    return
+                self._stream_active = True
+                self._record_start_time = time.perf_counter()
+            _dlog(f"[start_recording] s{sid} stream active | {self._debug_state()}")
         except Exception as e:
             _dlog(f"[start_recording] s{sid} FAILED: {e}")
             self._stream_active = False
             self._recording = False
+            self._record_start_time = None
+            self._auto_stop_triggered = False
             self.status = f"Recording failed: {e}"
             self._needs_redraw = True
             return
-        self._record_start_time = time.perf_counter()
         if self.deafen_while_recording != "off":
             self._mute_system()
         self.status = f"Recording... 0.0s / {MAX_RECORDING_DURATION:.0f}s"
         self._needs_redraw = True
-        _dlog(f"[start_recording] s{sid} done")
+        _dlog(f"[start_recording] s{sid} done | {self._debug_state()}")
 
     def _stop_recording(self):
         sid = self._recording_session
-        _dlog(f"[stop_recording] s{sid} enter | "
-              f"recording={self._recording} stream_active={self._stream_active} "
-              f"key_held={self._key_held} cb_count={self._cb_count} "
-              f"chunks={len(self._chunks)} stream={self._stream is not None}")
+        _dlog(f"[stop_recording] s{sid} enter | {self._debug_state()}")
         with self._recording_lock:
             if not self._recording:
-                _dlog(f"[stop_recording] s{sid} not recording, bail")
+                if self._stream_active:
+                    _dlog(f"[stop_recording] s{sid} bail with stream still active; "
+                          f"forcing stream idle | {self._debug_state()}")
+                    self._stream_active = False
+                    self._record_start_time = None
+                    self._auto_stop_triggered = False
+                else:
+                    _dlog(f"[stop_recording] s{sid} not recording, bail | {self._debug_state()}")
                 return
             self._recording = False
         elapsed = time.perf_counter() - self._record_start_time if self._record_start_time else 0
         self._record_start_time = None
+        self._auto_stop_triggered = False
         self._stream_active = False  # callback becomes a no-op; stream stays open
         _dlog(f"[stop_recording] s{sid} deactivated (kept open) | "
-              f"elapsed={elapsed:.2f}s cb_count={self._cb_count}")
+              f"elapsed={elapsed:.2f}s {self._debug_state()}")
 
         if self.deafen_while_recording != "off":
             self._unmute_system()
